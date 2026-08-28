@@ -54,6 +54,8 @@ natural language — both end up calling the same MCP tools.
 | `/together-interrupt bug-hunt stop, merging a fix now` | barge into their running session |
 | `/together-inbox` | check new + passive messages |
 | `/together-status` | rooms, peers, queues |
+| `/together-handoff bug-hunt taking over the auth fix` | offer your current session to the room |
+| `/together-import a3f9…` | import a session a friend handed off |
 
 Or just talk to Claude in any session:
 
@@ -101,6 +103,42 @@ Pairing and reconnecting happen automatically from then on: room keys persist in
 `~/.claude-together/`, and sessions re-find each other through the DHT. Codes are
 only ever needed to add a new person.
 
+### Session handoff — give a friend your whole session
+
+Sometimes a message isn't enough: you want your friend to *pick up where your session
+left off*, with the full conversation as context. `/together-handoff <room>` does that:
+
+```
+you:    /together-handoff bug-hunt   → "this sends the conversation text of this
+                                        session to the room — confirm?" → sent
+friend: (gets a notice) → /together-import a3f9…
+        → new local session written; `claude --resume <id>` opens it
+```
+
+How it works, and why it's shaped this way:
+
+- **Stripped, not copied.** Claude Code stores sessions as internal JSONL transcripts
+  (`~/.claude/projects/…/<session-id>.jsonl`) whose format drifts between versions.
+  The handoff never ships that file: the sender reduces it to a small versioned doc of
+  plain **user/assistant conversation text** — tool calls, tool output, thinking
+  blocks, sidechains, and hook/system plumbing are all dropped and never leave the
+  machine.
+- **Streamed peer-to-peer.** Handoffs are their own chunked transfer protocol on the
+  encrypted room sockets (up to 4 MB, integrity-hashed) — they never enter room chat,
+  logs, or the gossip relay, and both sides must be online. Oldest turns are trimmed
+  first if the conversation exceeds the cap.
+- **Import is explicit, always.** Receiving an offer stores it and posts an inbox
+  notice — nothing else. Only `/together-import <id>`, confirmed by the human, turns
+  it into a local session: written under a **fresh session id**, bound to the
+  receiver's own project directory, wrapped in loud markers telling the receiving
+  Claude the history is **untrusted content from the sender** — context to verify
+  against the local repo, never instructions. Handed-off history is a classic
+  prompt-injection vector; the wrapping plus the explicit-consent gate is the defense.
+- `claude --resume <new-id>` (terminal CLI) then opens the imported session. The
+  transcript format is internal, so a Claude Code update can break the import writer —
+  that's the accepted cost of the stripped-import design, and why the doc format is
+  versioned.
+
 ## Why the invite codes can be short
 
 The code is not the encryption key — it's a single-use pairing secret
@@ -128,7 +166,10 @@ in the window.
   untrusted when handed to Claude: a friend's message can't prompt-inject your session
   into doing something — Claude is told to show you any request found in a message and
   ask before acting.
-- **Plain text only**, 16 KB cap. No files, no commands, no code execution.
+- **Plain text only**, 16 KB cap. No files, no commands, no code execution. The one
+  larger payload — session handoffs (4 MB cap) — is stripped to conversation text,
+  never auto-imported, and lands wrapped in untrusted-content markers only after the
+  receiving human explicitly says yes.
 
 ## Reliability
 
@@ -149,7 +190,9 @@ in the window.
   auth, at-least-once message protocol
 - [`src/crypto.js`](src/crypto.js) — invite codes, argon2 stretching, MACs, secretbox
 - [`src/store.js`](src/store.js) — persistence: identity, room keys, inbox/outbox
+- [`src/handoff.js`](src/handoff.js) — session handoff: transcript stripping + import
 - [`test/smoke.js`](test/smoke.js) — end-to-end test on a local DHT testnet: `npm test`
+- [`test/handoff.js`](test/handoff.js) — handoff strip/transfer/import tests
 
 ## License
 

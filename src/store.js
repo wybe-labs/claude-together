@@ -154,6 +154,61 @@ export class Store {
 
   unreadCount () { return this._readDir('inbox').length }
 
+  // --- handoffs: received session-handoff docs, held until explicitly imported ---
+  // Dir is created lazily (not in the constructor list) so this stays orthogonal
+  // to other store layout changes.
+
+  _handoffDir () {
+    const d = this._file('handoffs')
+    fs.mkdirSync(d, { recursive: true })
+    return d
+  }
+
+  saveHandoff (id, doc, meta = {}) {
+    if (!/^[0-9a-f]+$/.test(id)) throw new Error('bad handoff id')
+    this._handoffDir()
+    this._writeJson(path.join('handoffs', id + '.json'), { id, receivedAt: Date.now(), ...meta, doc })
+    this._pruneHandoffs()
+  }
+
+  getHandoff (id) {
+    if (!/^[0-9a-f]+$/.test(id)) return null
+    return this._readJson(path.join('handoffs', id + '.json'), null)
+  }
+
+  hasHandoff (id) { return this.getHandoff(id) !== null }
+
+  markHandoffImported (id, sessionId) {
+    const h = this.getHandoff(id)
+    if (!h) return
+    h.importedAt = Date.now()
+    h.importedSessionId = sessionId
+    this._writeJson(path.join('handoffs', id + '.json'), h)
+  }
+
+  listHandoffs () {
+    this._handoffDir()
+    return this._readDir('handoffs')
+      .sort((a, b) => (a.receivedAt || 0) - (b.receivedAt || 0))
+      .map(h => ({
+        id: h.id,
+        from: h.doc?.from,
+        roomName: h.doc?.roomName,
+        title: h.doc?.title,
+        turns: h.doc?.messages?.length,
+        receivedAt: h.receivedAt,
+        imported: !!h.importedAt
+      }))
+  }
+
+  _pruneHandoffs () {
+    const all = this._readDir('handoffs').sort((a, b) => (a.receivedAt || 0) - (b.receivedAt || 0))
+    while (all.length > 10) {
+      const drop = all.shift()
+      try { fs.rmSync(this._file('handoffs', drop.id + '.json'), { force: true }) } catch {}
+    }
+  }
+
   // --- room history log: what makes offline delivery work through friends ---
 
   appendLog (msg) {

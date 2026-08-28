@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/server.js",
     "register": "node scripts/register.js",
-    "test": "node test/smoke.js",
+    "test": "node test/smoke.js && node test/handoff.js",
+    "test:handoff": "node test/handoff.js",
     "test:live": "node test/live.js"
   },
   "repository": {

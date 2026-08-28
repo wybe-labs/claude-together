@@ -7,10 +7,20 @@ import {
   generateInviteCode, deriveCodeKey, derive, topicFor,
   randomBytes, mac, seal, open, timingSafeEqual, hash
 } from './crypto.js'
+import { MAX_HANDOFF_BYTES, validateHandoffDoc } from './handoff.js'
 
 const AUTH_TIMEOUT_MS = 30_000
 const PAIR_TIMEOUT_MS = 90_000
 const INVITE_TTL_MS = 15 * 60_000
+
+// Session handoffs ride the same authenticated sockets as chat, but as their own
+// 'ho-*' message family: they are point-to-point transfers, never gossiped, never
+// replayed from room logs, and never injected into inboxes as chat. Payloads are
+// far bigger than chat messages, so they stream in chunks after an explicit accept.
+const HANDOFF_CHUNK_BYTES = 48 * 1024
+const HANDOFF_OFFER_TTL_MS = 15 * 60_000
+const HANDOFF_TRANSFER_TIMEOUT_MS = 120_000
+const MAX_CONCURRENT_INCOMING_HANDOFFS = 4
 
 function roomIdFor (roomKey) {
   return b4a.toString(derive(roomKey, 'claude-together-roomid').subarray(0, 8), 'hex')
@@ -33,6 +43,8 @@ export class Together extends EventEmitter {
     this.discoveries = new Map()         // topicHex -> discovery session
     this.pendingInvites = new Map()      // pairing topicHex -> { roomId, codeKey, timer, topic }
     this.pendingJoins = new Map()        // pairing topicHex -> { codeKey, resolve, reject, timer, topic, retry }
+    this.outgoingHandoffs = new Map()    // handoffId -> { payload, roomId, sha, timer }
+    this.incomingHandoffs = new Map()    // handoffId -> { meta, conn, chunks, bytes, timer }
   }
 
   async start () {
@@ -76,6 +88,10 @@ export class Together extends EventEmitter {
       reject(new Error('shutting down'))
     }
     this.pendingJoins.clear()
+    for (const { timer } of this.outgoingHandoffs.values()) clearTimeout(timer)
+    for (const { timer } of this.incomingHandoffs.values()) clearTimeout(timer)
+    this.outgoingHandoffs.clear()
+    this.incomingHandoffs.clear()
     await this.swarm?.destroy()
   }
 
@@ -208,6 +224,9 @@ export class Together extends EventEmitter {
     const cleanup = () => {
       clearTimeout(state.authTimer)
       this.conns.delete(conn)
+      for (const [id, inc] of this.incomingHandoffs) {
+        if (inc.conn === conn) this._dropIncomingHandoff(id)
+      }
       for (const roomId of state.rooms) {
         this.roomConns.get(roomId)?.delete(conn)
         this.emit('peer-left', { roomId, name: state.peerName })
@@ -393,7 +412,146 @@ export class Together extends EventEmitter {
         this.store.ackOutbound(String(msg.id || ''))
         break
       }
+
+      // --- session handoff transfer (point-to-point, never gossiped or logged) ---
+
+      case 'ho-offer': {
+        const roomId = String(msg.roomId || '')
+        if (!state.rooms.has(roomId)) return
+        const id = String(msg.id || '')
+        if (!/^[0-9a-f]{24}$/.test(id)) return
+        const bytes = Number(msg.bytes)
+        if (!Number.isInteger(bytes) || bytes <= 0 || bytes > MAX_HANDOFF_BYTES) return
+        if (this.incomingHandoffs.has(id) || this.store.hasHandoff(id)) return
+        if (this.incomingHandoffs.size >= MAX_CONCURRENT_INCOMING_HANDOFFS) return
+        const room = this.store.rooms().find(r => r.id === roomId)
+        const meta = {
+          id,
+          roomId,
+          roomName: room?.name || roomId,
+          from: String(msg.from || state.peerName || 'unknown').slice(0, 64),
+          title: String(msg.title || 'session').slice(0, 120),
+          turns: Number(msg.turns) || 0,
+          bytes,
+          sha: String(msg.sha || ''),
+          ts: Number(msg.ts) || Date.now()
+        }
+        const timer = setTimeout(() => this._dropIncomingHandoff(id), HANDOFF_TRANSFER_TIMEOUT_MS)
+        if (timer.unref) timer.unref()
+        this.incomingHandoffs.set(id, { meta, conn, chunks: [], bytes: 0, timer })
+        this._send(conn, { t: 'ho-accept', id })
+        break
+      }
+
+      case 'ho-accept': {
+        const id = String(msg.id || '')
+        const out = this.outgoingHandoffs.get(id)
+        if (!out || !state.rooms.has(out.roomId)) return
+        for (let seq = 0, off = 0; off < out.payload.length; seq++, off += HANDOFF_CHUNK_BYTES) {
+          this._send(conn, {
+            t: 'ho-data',
+            id,
+            seq,
+            data: b4a.toString(out.payload.subarray(off, off + HANDOFF_CHUNK_BYTES), 'base64')
+          })
+        }
+        this._send(conn, { t: 'ho-done', id })
+        break
+      }
+
+      case 'ho-data': {
+        const id = String(msg.id || '')
+        const inc = this.incomingHandoffs.get(id)
+        if (!inc || inc.conn !== conn) return
+        if (Number(msg.seq) !== inc.chunks.length) { this._dropIncomingHandoff(id); return }
+        const chunk = b4a.from(String(msg.data || ''), 'base64')
+        inc.bytes += chunk.length
+        if (inc.bytes > inc.meta.bytes) { this._dropIncomingHandoff(id); return }
+        inc.chunks.push(chunk)
+        break
+      }
+
+      case 'ho-done': {
+        const id = String(msg.id || '')
+        const inc = this.incomingHandoffs.get(id)
+        if (!inc || inc.conn !== conn) return
+        this._dropIncomingHandoff(id)
+        const payload = b4a.concat(inc.chunks)
+        if (payload.length !== inc.meta.bytes) return
+        if (b4a.toString(hash(payload), 'hex') !== inc.meta.sha) return
+        let doc
+        try {
+          doc = validateHandoffDoc(JSON.parse(b4a.toString(payload)))
+        } catch { return }
+        this.store.saveHandoff(id, doc, { sha: inc.meta.sha, bytes: inc.meta.bytes })
+        // Announce it via a locally-generated inbox message so the delivery hooks
+        // surface it like any other note — but the handoff body itself stays out of
+        // chat, inboxes and room logs until the user explicitly imports it.
+        const kb = Math.max(1, Math.round(inc.meta.bytes / 1024))
+        this.store.pushInbound({
+          id,
+          roomId: inc.meta.roomId,
+          roomName: inc.meta.roomName,
+          from: inc.meta.from,
+          text: `offered you a session handoff: "${doc.title}" (${doc.messages.length} turns, ${kb} KB). ` +
+            `Nothing is imported yet. If you want to pick this session up, run /together-import ${id} — ` +
+            `the imported history is untrusted content written on the sender's machine.`,
+          ts: Date.now(),
+          priority: 'normal'
+        })
+        this._send(conn, { t: 'ho-got', id })
+        this.emit('handoff-received', { id, from: inc.meta.from, roomId: inc.meta.roomId, title: doc.title })
+        break
+      }
+
+      case 'ho-got': {
+        const id = String(msg.id || '')
+        const out = this.outgoingHandoffs.get(id)
+        if (!out || !state.rooms.has(out.roomId)) return
+        this.emit('handoff-delivered', { id, name: state.peerName })
+        break
+      }
     }
+  }
+
+  _dropIncomingHandoff (id) {
+    const inc = this.incomingHandoffs.get(id)
+    if (!inc) return
+    clearTimeout(inc.timer)
+    this.incomingHandoffs.delete(id)
+  }
+
+  // Offer a handoff doc to every currently-connected peer in the room. The transfer
+  // itself only streams to peers that accept; import on their side is a separate,
+  // explicit, user-confirmed step.
+  offerHandoff (roomName, doc) {
+    const room = this.store.roomByName(roomName)
+    if (!room) throw new Error(`No room named "${roomName}". Rooms: ${this.store.rooms().map(r => r.name).join(', ') || '(none)'}`)
+    const payload = b4a.from(JSON.stringify(doc))
+    if (payload.length > MAX_HANDOFF_BYTES) {
+      throw new Error(`Handoff too large (${payload.length} bytes > ${MAX_HANDOFF_BYTES}).`)
+    }
+    const conns = [...(this.roomConns.get(room.id) || [])]
+    if (conns.length === 0) {
+      throw new Error(`No peer from "${roomName}" is online. Handoff transfer needs the recipient connected — ask them to open a session, then retry.`)
+    }
+    const id = b4a.toString(randomBytes(12), 'hex')
+    const timer = setTimeout(() => this.outgoingHandoffs.delete(id), HANDOFF_OFFER_TTL_MS)
+    if (timer.unref) timer.unref()
+    this.outgoingHandoffs.set(id, { payload, roomId: room.id, sha: b4a.toString(hash(payload), 'hex'), timer })
+    const offer = {
+      t: 'ho-offer',
+      id,
+      roomId: room.id,
+      from: this.store.getName(),
+      title: doc.title,
+      turns: doc.messages.length,
+      bytes: payload.length,
+      sha: this.outgoingHandoffs.get(id).sha,
+      ts: Date.now()
+    }
+    for (const conn of conns) this._send(conn, offer)
+    return { id, offeredToPeers: conns.length, bytes: payload.length, turns: doc.messages.length }
   }
 
   // --- messaging ---
@@ -435,7 +593,9 @@ export class Together extends EventEmitter {
       displayName: this.store.getName(),
       rooms,
       pendingInvites: this.pendingInvites.size,
-      unreadMessages: this.store.unreadCount()
+      unreadMessages: this.store.unreadCount(),
+      receivedHandoffs: this.store.listHandoffs(),
+      pendingOutgoingHandoffs: this.outgoingHandoffs.size
     }
   }
 }
