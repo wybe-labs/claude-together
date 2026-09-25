@@ -25,7 +25,16 @@ function cmpVersion (a, b) {
 
 const AUTH_TIMEOUT_MS = 30_000
 const PAIR_TIMEOUT_MS = 90_000
-const INVITE_TTL_MS = 5 * 60_000
+// How long an invite code stays live before the inviter drops the pairing rendezvous.
+// Pairing needs both sides online at once, so a code that outlives its window just
+// times out the joiner. Default 30 min; override with CLAUDE_TOGETHER_INVITE_TTL_MIN
+// (minutes, clamped 1..1440). Read once at startup, so a change takes effect on the
+// next MCP-server restart.
+const INVITE_TTL_MS = (() => {
+  const raw = Number(process.env.CLAUDE_TOGETHER_INVITE_TTL_MIN)
+  const minutes = Number.isFinite(raw) && raw > 0 ? Math.min(Math.max(raw, 1), 1440) : 30
+  return minutes * 60_000
+})()
 // Largest single newline-delimited frame we'll buffer from a peer. The biggest
 // legitimate frame is one 16 KB message plus its base64/JSON envelope; 256 KB is
 // generous headroom while still bounding a flood.
