@@ -43,10 +43,18 @@ function render (msgs) {
     'key-changed': ' ⚠ SIGNED WITH A DIFFERENT KEY than this sender used before — possible impersonation',
     'unsigned-expected-signed': ' ⚠ unsigned, but this sender previously signed their messages — possible impersonation or downgrade'
   }
+  // Identity is the key, not the display name. Say so once, with the fingerprint,
+  // the first time a sender appears — after that it is pinned and silence means it
+  // still matches. Formatted inline to keep this hook dependency-free.
+  const note = m => m.auth === 'self'
+    ? ' (another of your own sessions — same identity key)'
+    : m.auth === 'verified-new' && m.pk
+      ? ` (first message from this sender — identity key ${m.pk.slice(0, 12).replace(/(.{4})(?=.)/g, '$1-')}, now pinned)`
+      : (warnings[m.auth] || '')
   const lines = msgs.map(m => {
     const where = [m.host, m.label, m.sid, m.harness ? `harness: ${m.harness}` : null]
       .filter(Boolean).join(' · ')
-    const warn = warnings[m.auth] || ''
+    const warn = note(m)
     if (m.kind !== 'presence') {
       const addr = Array.isArray(m.to) && m.to.length ? ` (to: ${m.to.join(', ')})` : ''
       return `[room: ${m.roomName}] ${m.from}${where ? ` (${where})` : ''}${addr}: ${m.text}${warn}`

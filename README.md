@@ -7,9 +7,12 @@ server, nothing to host, nothing to sign up for.
 
 ```
 you: "create an invite for room bug-hunt"
-      → invite code: X7KQ-2MPF-3HV9  (text it to your friend)
+      → rendezvous: X7KQ-2MPF-3HV9  (text it to your friend — it is not a secret)
 
 friend: "join room X7KQ-2MPF-3HV9"
+      → both of you see: 482 913   (say it out loud to each other)
+
+both: "confirm 482 913"
       → connected, directly, encrypted
 
 you: "tell bug-hunt: the leak is in token refresh, check session.ts"
@@ -20,9 +23,10 @@ Built on [Hyperswarm](https://github.com/holepunchto/hyperswarm): peers find eac
 through a public BitTorrent-style DHT, hole-punch a direct UDP connection, and talk over
 Noise-encrypted sockets. Exposed to Claude as an [MCP](https://modelcontextprotocol.io) server.
 
-**Current release: v0.3.1 (LTS)** — per-project room membership, signed messages
-(TOFU), session identifiers, and a version handshake. LTS: 0.3.x stays
-wire-compatible; peers on mismatched versions detect and report it in-session.
+**Current release: v0.4.0** — SAS pairing (no invite secret), per-project
+registration, receiver-side interrupt opt-in, and private-network bootstrap.
+**Wire-incompatible with 0.3.x pairing:** both sides must be on 0.4 to pair.
+Peers on mismatched versions detect and report it in-session.
 
 ### ▶ 30-second explainer
 
@@ -38,12 +42,23 @@ Requires [Node.js](https://nodejs.org) ≥ 18 and [Claude Code](https://claude.c
 git clone https://github.com/wybe-labs/claude-together
 cd claude-together
 npm install
-npm run register
+
+cd /path/to/your/project        # the project you want to be reachable in
+npm --prefix /path/to/claude-together run register
 ```
 
-`npm run register` runs `claude mcp add` for you (user scope, so it works in every
-project). If the `claude` CLI isn't on your PATH it prints the exact command to run
-manually. Then restart your Claude Code session — that's it.
+Registration is **per project**, not machine-wide: hooks go in that project's
+`.claude/settings.local.json`, the slash commands in its `.claude/commands`, and the
+MCP server is added at `--scope local`. A session in a project you never registered
+has no claude-together tools and no delivery hooks, so it cannot be pulled into a
+room — being reachable is something you turn on where you want it. Run it again in
+each project you want, and restart your Claude Code session.
+
+If the `claude` CLI isn't on your PATH it prints the exact command to run manually.
+
+> Upgrading from ≤0.3? Those versions installed hooks user-wide in
+> `~/.claude/settings.json`, where they fired in every project. `npm run register`
+> removes those entries (leaving any other hooks alone) and tells you it did.
 
 ## Usage
 
@@ -52,11 +67,12 @@ natural language — both end up calling the same MCP tools.
 
 | Slash command | Shorthand for |
 |---|---|
-| `/together-invite bug-hunt` | create a room + invite code |
-| `/together-join X7KQ-2MPF-3HV9` | redeem a friend's code |
+| `/together-invite bug-hunt` | create a room + open a pairing rendezvous |
+| `/together-join X7KQ-2MPF-3HV9` | answer a friend's rendezvous, get the number to compare |
+| `/together-confirm 482 913` | confirm the number you both read aloud — completes the pairing |
 | `/together-send bug-hunt found it, check session.ts` | send a message (lands when their turn ends) |
 | `/together-send bug-hunt to alice: here's that stack trace` | address specific people — only they get active delivery |
-| `/together-interrupt bug-hunt stop, merging a fix now` | barge into their running session |
+| `/together-interrupt bug-hunt stop, merging a fix now` | barge into their running session (if that room opted in) |
 | `/together-inbox` | check new + passive messages |
 | `/together-history bug-hunt` | re-read recent room chat (non-destructive) |
 | `/together-status` | rooms, peers, members + last seen, queues |
@@ -65,13 +81,15 @@ Or just talk to Claude in any session:
 
 | You say | What happens |
 |---|---|
-| "create an invite for room `name`" | Creates the room, prints a short single-use code (5 min TTL). Keep your session open until your friend joins. |
-| "join room `X7KQ-2MPF-3HV9`" | Redeems a code from a friend; pairs in a few seconds. Everyone already in the room automatically gets a "`name` joined the room (`hostname` · `session label` · `harness`)" notice — even members who are offline see it when they reconnect. The label defaults to your project folder name; set `CLAUDE_TOGETHER_LABEL` to override it. |
+| "create an invite for room `name`" | Creates the room and opens a pairing rendezvous, printing a short id. The id is not a secret and does not expire. Keep your session open until the pairing completes. |
+| "join room `X7KQ-2MPF-3HV9`" | Answers a friend's rendezvous and returns a six-digit number to compare out of band; after you both confirm it, you are in. Everyone already in the room automatically gets a "`name` joined the room (`hostname` · `session label` · `harness`)" notice — even members who are offline see it when they reconnect. The label defaults to your project folder name; set `CLAUDE_TOGETHER_LABEL` to override it. |
 | "send to `name`: …" | Delivers instantly if they're online, otherwise queues on disk and delivers when you're both online. |
 | "check my messages" | Fetches everything unread, across all rooms. |
 | "multiplayer status" | Rooms, connected peers, known members with last-seen times, queued/unread counts. |
 | "show the history of `name`" | Re-reads the recent room log (last 200 msgs / 7 days) without touching your unread inbox. |
 | "set my display name to …" | The name shown on your messages. |
+| "link room `name`" | Adds *this* project to a room another project on this machine is already in, by copying the key locally. No pairing, no network. |
+| "relay through `key`" | Routes connections that cannot be made directly through a named relay. Off by default; a relay sees who talks to whom, though not what is said. |
 | "leave room `name`" | Deletes the room key, stops announcing on the DHT, and closes the room's connections. |
 
 **Version mismatches are detected on connect.** Sessions exchange their
@@ -89,9 +107,18 @@ surfaces your own mid-turn messages:
 
 | Priority | How it lands on the other side |
 |---|---|
-| `interrupt` (`/together-interrupt`) | Injected **mid-turn** at their Claude's next tool boundary — barges into running work. For "stop, don't merge that". |
 | `normal` (`/together-send`, default) | Delivered the moment their Claude **finishes its current turn** (or when they next prompt, if idle). |
+| `interrupt` (`/together-interrupt`) | *Requests* injection **mid-turn** at their Claude's next tool boundary. Honored only by rooms the receiver opted in (below); otherwise it lands at turn end. |
 | `passive` | Never injected. Waits quietly for `/together-inbox`. |
+
+**Interrupts are opt-in, per room, on the receiving side.** They are off by default,
+because the session being interrupted runs shell, docker and git commands, and a
+mid-turn injection arrives in the middle of that work — so whether a peer may barge
+in is the receiver's call, not the sender's. Turn it on for a room you trust by
+asking your Claude ("allow interrupts from bug-hunt"), and off again the same way;
+`status` shows the current setting per room. Opting out never loses messages, it only
+means they land at the end of the turn. Senders are told the interrupt may be
+downgraded, so nobody reads a lack of barge-in as the message not arriving.
 
 **Addressing specific people.** Any message can carry a "to" list of display names
 (`/together-send bug-hunt to alice: …`, or just "tell alice …"). Every member still
@@ -106,6 +133,56 @@ decides whose session is actively notified.
 Every injected message is framed as untrusted data with an explicit instruction to
 relay it to the human and ask before acting on anything it requests — a friend's
 message can inform your Claude, never command it.
+
+### Several working directories, one room
+
+Room membership belongs to the project directory, so a room you joined in one checkout
+is not joined in another. To add a second directory, ask Claude there to **link** the
+room:
+
+```
+you (in ~/code/other-thing): "link the bug-hunt room"
+→ copies the key from your other project, joins the topic, and you appear to the room
+  as a second peer
+```
+
+This is a local copy, not a pairing. Pairing exists to move a room key between two
+people who have no prior trust, which is what the rendezvous and the spoken number are
+for; between two directories the same person owns there is no second party and no new
+trust, and the key is already on the machine. So there is nothing to compare and
+nothing new is granted. The room's other members are told another of your sessions
+joined, because a second session gaining read access is their business.
+
+Each project keeps its **own inbox**, which is the reason not to point every session at
+one shared store instead: reading an inbox deletes what it read, so sessions sharing one
+would compete and each message would reach whichever session happened to look first.
+With separate stores every session receives every message.
+
+Your identity key is machine-global, so all your sessions sign with the same key and
+peers see one member with several connected peers, told apart by project label and
+session id. Set `CLAUDE_TOGETHER_LABEL` per project to make them readable. A message
+from one of your own sessions is labelled as such rather than as a new sender, so
+nothing invites you to go and check a fingerprint against yourself.
+
+A room name that means two different rooms on this machine is refused rather than
+guessed at, since picking the wrong one would join a conversation you did not mean.
+
+**No restart, and no session needed.** Linking writes a key into the project's store,
+and a session already running there joins the room on its next maintenance pass — about
+half a minute — because that pass re-reads the store precisely to pick up rooms another
+local session joined. A session started later joins at startup. So the same thing can be
+done from a shell, without a session in that directory at all:
+
+```
+node scripts/link-room.js --project /path/to/project --room bug-hunt
+```
+
+The copy is local, but the script does go on the network for a moment so the room's
+other members still get told another session joined; if nobody is online the notice
+queues and goes out later. It resolves the store the way a session in that directory
+would rather than being pointed at a path: a store handed an explicit directory holds
+its own identity, which would mint a second signing key for this machine and make your
+own sessions look like different people to everyone else.
 
 ### Groups, not just co-op
 
@@ -141,20 +218,44 @@ listing them — mint fresh invites in the projects that need them, or set
 `CLAUDE_TOGETHER_DIR=~/.claude-together` to keep using the old shared store. Your
 display name (and new signing identity) carry over automatically.
 
-## Why the invite codes can be short
+## Why there is no invite secret
 
-The code is not the encryption key — it's a single-use pairing secret
-(the [magic-wormhole](https://github.com/magic-wormhole/magic-wormhole) trick):
+Pairing does not rely on the id staying private, so there is nothing to leak, nothing
+to expire, and no window to miss. The id names a meeting point; **two humans reading
+six digits to each other** is what authenticates the exchange:
 
-1. Both sides stretch the code with **argon2id** (64 MB memory-hard) into a pairing key
-   and meet at a DHT topic derived from it.
-2. They prove knowledge of the code to each other with nonce-bound MACs — a stranger
-   who finds the meeting point can't complete the handshake.
-3. Over that authenticated, encrypted link the inviter hands over the room's real
-   random **256-bit key**. The code is then retired forever.
+1. Both sides meet at a DHT topic derived from the (public) rendezvous id and open a
+   Noise-encrypted socket.
+2. Each sends its long-lived **ed25519 identity key** together with a fresh **X25519**
+   key, signed — so an ephemeral key cannot be offered under someone else's identity.
+3. Both derive the same **six-digit number** from the transcript (both identity keys,
+   both ephemeral keys, the id), ordered so each side computes it identically.
+4. The humans compare that number out of band. On confirmation, the inviter encrypts
+   the room's random **256-bit key** to the X25519 secret they agreed.
 
-60 bits of entropy + argon2 + single-use + 5-minute expiry ≫ anything brute-forceable
-in the window.
+A man-in-the-middle has to substitute its own key toward at least one side to read
+anything — which changes the number that side sees, so the comparison fails. Relaying
+the real keys untouched keeps the numbers matching but leaves the attacker without the
+agreed secret, so the room key stays unreadable. Its only escape is guessing which
+six digits to show, at 1-in-a-million, against two people about to say them aloud.
+
+**This shifts the burden onto the comparison.** Rubber-stamping the number without
+actually checking it removes the entire protection — the number must be exchanged on a
+channel an attacker on the rendezvous does not control (a call, in person), never in the
+same chat you pasted the id into. `confirm_pairing` exists so that step is a deliberate
+human act; Claude is told never to perform it on your behalf.
+
+An open rendezvous is kept in the store, so it survives restarting Claude Code: an id
+you shared yesterday still works today, and only completing it or `cancel_pairing` ends
+it. The agreement key is stored with it, so the number this side shows does not change
+across a restart — otherwise a peer still holding the old number would see a second
+entry appear under the same name with a different number, which is exactly the shape of
+the impersonation the comparison is there to catch.
+
+Multiple peers may answer the same public rendezvous — that is expected, not an attack
+in itself. Each gets its own number, `status` lists them side by side with the name,
+host and key fingerprint, and confirming a number is what selects which one you paired
+with.
 
 ## Security model
 
@@ -181,15 +282,15 @@ trusted.
 ### Limitations — know these before trusting it with anything sensitive
 
 - **A room key is permanent and unrevocable.** Anyone who ever holds it — an invited
-  member, or whoever redeems a leaked code first within its 5-minute window (an
-  invite is spent the moment its key is handed over, so only one redeemer wins) —
-  keeps read/write access forever. `leave_room` only deletes *your own* copy; it can't evict anyone else.
+  member, or anyone a member confirms a pairing with — keeps read/write access forever. `leave_room` only deletes *your own* copy; it can't evict anyone else.
   **You cannot kick a member.** The only way to exclude someone is for everyone else to
   start a fresh room. There is no forward secrecy: a leaked key exposes past logged
   history and all future messages.
-- **Sender authenticity is trust-on-first-use, not absolute.** Every message is signed
-  with a long-lived per-identity ed25519 key; receivers pin a sender's key the first
-  time they see it and warn loudly if a later message is signed with a different key
+- **Sender authenticity rests on the key, not the name.** Every message is signed
+  with a long-lived per-identity ed25519 key. A key confirmed through a SAS pairing is
+  pinned by that human check; otherwise the first message from a sender says so and
+  shows the fingerprint, and the key is pinned from then on. Later messages signed with
+  a different key warn loudly
   (or arrives unsigned from a sender who used to sign). But the *first* message from a
   name is taken on faith, display names are not unique, and `host`/`label`/`sid` remain
   self-asserted decoration. Treat the warnings as real, and the absence of warnings as
@@ -199,8 +300,9 @@ trusted.
   (mid-turn for `interrupt` priority, when the agent has tool access). The untrusted-data
   framing reduces but does not eliminate the risk that a crafted message manipulates the
   receiving agent. Don't run Claude Together in a session with dangerous auto-approved
-  tools while in a room with people you don't trust, and prefer `normal`/`passive` over
-  `interrupt` from untrusted senders.
+  tools while in a room with people you don't trust. Mid-turn injection is off unless
+  you opted that room in, which is the setting to leave alone for any room you don't
+  fully trust — but `normal` delivery still reaches the same agent, one turn later.
 - **Every message carries your hostname, project-folder name, a per-session id, and a harness tag**
   (so members can tell your machines, projects, and sessions apart). Set
   `CLAUDE_TOGETHER_LABEL` to override the folder name; your machine hostname is
@@ -223,16 +325,136 @@ to your inbox, and start a new room if it might have leaked.
   hole punching can fail (~5% of pairings). Easiest fix: both install
   [Tailscale](https://tailscale.com) — the swarm then finds the direct tailnet path.
 
+### Corporate networks: use your own bootstrap node
+
+Peers behind one restrictive corporate NAT hit a variant of the above that Tailscale
+isn't always allowed to solve, and being on the same LAN does not help: discovery is
+global-DHT-only, so both sides are introduced by public address and then fail to
+hole-punch back into their own network. Both sides simply time out.
+
+Run a small DHT cluster inside the network instead, on any machine both can reach:
+
+```
+npm run bootstrap-node -- --host <lan ip>     # leave running; port 49737, 3 members
+```
+
+Then point every session at it and restart them:
+
+```
+CLAUDE_TOGETHER_BOOTSTRAP=<lan ip>:49737
+```
+
+Discovery and the connection then stay entirely inside the LAN. `status` reports which
+bootstrap a session is using — sessions on different bootstraps form separate DHTs and
+cannot see each other, so the value must match everywhere.
+
+**It has to be a cluster, not one node.** hyperdht keeps a node ephemeral and firewalled
+until several distinct nodes can vouch for its reachability, and a node in neither state
+joins no routing table. Point two sessions at a lone bootstrapper and they announce on a
+topic, find each other, and then never connect: every connection falls back to a hole
+punch with nobody to coordinate it. From the outside that is indistinguishable from a
+peer who never showed up — no error, no peer, nothing in either log. hyperdht's own
+testnet starts its nodes with ephemeral and firewalled both off for the same reason.
+
+The host must be an address your peers can reach. Not a hostname: it is handed to peers
+as the address to talk to, and a name like `myhost` usually resolves to `127.0.1.1`
+locally and to nothing at all on theirs, which leaves your session advertising a
+loopback address.
+
+**Changing it needs no restart.** `set_bootstrap` repoints discovery and applies it
+immediately, and `start_local_bootstrap` starts the cluster above and points at it in one
+step; `stop_local_bootstrap` stops it. The choice is remembered for the machine, so later
+sessions start on the same DHT without anything being exported. `CLAUDE_TOGETHER_BOOTSTRAP`
+still wins for a process that sets it, so an explicit environment is never quietly
+overridden — the stored value applies to sessions that come later.
+
+Stopping the cluster deliberately does *not* move discovery back to the public nodes.
+Doing that silently would change who a session can reach without anyone asking for it,
+so it is a separate call.
+
+### When a direct connection is impossible: relaying
+
+Some networks refuse to hole-punch at all, and no bootstrap fixes that — discovery was
+never the hard part, the connection is. `set_relay` names a node to carry connections
+that cannot be made directly, by its 64-character hex public key.
+
+It is a fallback rather than a mode. Hyperswarm tries a direct connection every time and
+only falls back once the punch has actually failed, so naming a relay costs nothing while
+direct connections work.
+
+**What it gives up.** A relay carries your traffic. Messages stay end-to-end encrypted
+and it cannot read them, but it learns that two peers are talking, how much, and when —
+and this project otherwise involves no third party at all. That is a real change to "no
+relay, nothing to host", so it is off by default and has to be turned on deliberately.
+
+No relay is bundled. The key must name a node you run somewhere both peers can reach, or
+one you have been given and trust.
+
+### Peers on separate networks
+
+A private cluster only helps when every peer can reach it. Two people on different
+corporate networks cannot, so a LAN bootstrap does nothing for them and they need
+either the public DHT or a bootstrap both can actually reach — a host on the internet,
+or a shared overlay such as [Tailscale](https://tailscale.com), which is also the
+simpler answer to hole-punching failures generally.
+
+The public DHT is worth trying first between separate networks. It has plenty of nodes
+to coordinate a hole punch, which is exactly what a lone bootstrapper cannot do, and
+the case it struggles with — both peers behind one NAT that will not hairpin — is not
+the case two separate networks are in.
+
+To keep it up across reboots, run it under systemd as your own user:
+
+```ini
+# ~/.config/systemd/user/claude-together-bootstrap.service
+[Unit]
+Description=Claude Together private DHT bootstrap cluster
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/claude-together-bootstrap.env
+ExecStart=/path/to/node /path/to/claude-together/scripts/bootstrap-node.js \
+  --host ${HOST} --port ${PORT} --nodes ${NODES}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+with `HOST`, `PORT` and `NODES` in `~/.config/claude-together-bootstrap.env`, then:
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now claude-together-bootstrap
+sudo loginctl enable-linger $USER    # or it only runs while you are logged in
+```
+
 ## Repo layout
 
 - [`test/security.js`](test/security.js) — path-traversal regression test (`npm run test:security`)
 - [`src/server.js`](src/server.js) — MCP server and tool definitions
 - [`src/transport.js`](src/transport.js) — Hyperswarm swarm, pairing handshake, room
   auth, at-least-once message protocol
-- [`src/crypto.js`](src/crypto.js) — invite codes, argon2 stretching, MACs, secretbox
+- [`src/crypto.js`](src/crypto.js) — rendezvous ids, SAS derivation, X25519 agreement, signatures, secretbox
 - [`src/store.js`](src/store.js) — persistence: identity, room keys, inbox/outbox
 - [`src/scope.js`](src/scope.js) — per-project store scoping (shared by server and hooks)
+- [`src/hooks.js`](src/hooks.js) — where delivery hooks live and whether they are installed
+- [`scripts/bootstrap-node.js`](scripts/bootstrap-node.js) — DHT bootstrap node for a
+  private network: `npm run bootstrap-node -- --host <lan ip>`
+- [`scripts/statusline.py`](scripts/statusline.py) — Claude Code status line: usage
+  gauges plus room, unread and last-message state (`--demo` to preview)
+- [`scripts/link-room.js`](scripts/link-room.js) — add a working directory to a room
+  this machine already holds, without a session in it
 - [`test/smoke.js`](test/smoke.js) — end-to-end test on a local DHT testnet: `npm test`
+- [`test/pairing.js`](test/pairing.js) — SAS pairing and identity pinning
+- [`test/pairing-restart.js`](test/pairing-restart.js) — a rendezvous outliving the process
+- [`test/interrupts.js`](test/interrupts.js) — receiver-side interrupt opt-in
+- [`test/outbox.js`](test/outbox.js) — at-least-once retry of queued messages
+- [`test/link.js`](test/link.js) — a second working directory joining a room locally
+- [`test/bootstrap.js`](test/bootstrap.js) — repointing discovery while the session runs
+- [`test/register.js`](test/register.js) — per-project hook installation
 
 ## License
 

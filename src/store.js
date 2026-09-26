@@ -13,6 +13,20 @@ const LOG_TRIM_AT = 600
 const MAX_SEEN = 20_000
 const SEEN_COMPACT_AT = 60_000
 
+// Rooms held by another store on this machine, read without instantiating it (that
+// would create directories and run migrations in someone else's store).
+export function roomsInStore (dir) {
+  let config
+  try {
+    config = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'))
+  } catch {
+    return []
+  }
+  return Object.entries(config.rooms || {}).map(([id, r]) => ({
+    id, name: r.name, key: b4a.from(r.key, 'base64')
+  }))
+}
+
 // Multi-process-safe persistence. Several Claude Code sessions may each run their own
 // server instance against this same directory, so everything is either append-only
 // (seen.jsonl, log/*.jsonl) or file-per-message keyed by message id (inbox/, outbox/) —
@@ -111,6 +125,37 @@ export class Store {
 
   getName () { return this._readIdentity().name || null }
 
+  // Where discovery bootstraps, remembered machine-wide rather than per project: it
+  // describes the network this computer is on, which does not change between checkouts.
+  // Null means the public nodes. CLAUDE_TOGETHER_BOOTSTRAP still wins for a process
+  // that sets it, so an explicit environment is never quietly overridden by a stored one.
+  getBootstrap () {
+    const stored = this._readIdentity().bootstrap
+    return Array.isArray(stored) && stored.length ? stored : null
+  }
+
+  // Public key of a node that will carry connections which cannot be made directly.
+  // Machine-wide for the same reason as the bootstrap: it is a property of the network
+  // this computer sits on.
+  getRelay () {
+    const stored = this._readIdentity().relay
+    return typeof stored === 'string' && /^[0-9a-f]{64}$/.test(stored) ? stored : null
+  }
+
+  setRelay (key) {
+    this._updateIdentity(c => {
+      if (key) c.relay = key
+      else delete c.relay
+    })
+  }
+
+  setBootstrap (nodes) {
+    this._updateIdentity(c => {
+      if (nodes && nodes.length) c.bootstrap = nodes
+      else delete c.bootstrap
+    })
+  }
+
   setName (name) {
     this._updateIdentity(c => { c.name = name })
   }
@@ -133,7 +178,23 @@ export class Store {
 
   addRoom (id, name, keyBuf) {
     const c = this._config()
-    c.rooms[id] = { name, key: b4a.toString(keyBuf, 'base64') }
+    // Re-adding a room (a fresh invite into one you're already in) must not silently
+    // re-arm interrupts: carry the existing choice over.
+    c.rooms[id] = {
+      name,
+      key: b4a.toString(keyBuf, 'base64'),
+      allowInterrupt: c.rooms[id]?.allowInterrupt === true
+    }
+    this._writeJson('config.json', c)
+  }
+
+  // Mid-turn interrupts are opt-in per room, and the choice belongs to the receiving
+  // session: it runs shell, docker and git, so whether a peer may barge into its turn
+  // is not the sender's call. Off means the message still arrives, at turn end.
+  setRoomInterrupts (id, allow) {
+    const c = this._config()
+    if (!c.rooms[id]) throw new Error(`no room with id ${id} in this project's store`)
+    c.rooms[id].allowInterrupt = allow === true
     this._writeJson('config.json', c)
   }
 
@@ -161,8 +222,56 @@ export class Store {
 
   rooms () {
     return Object.entries(this._config().rooms).map(([id, r]) => ({
-      id, name: r.name, key: b4a.from(r.key, 'base64')
+      id, name: r.name, key: b4a.from(r.key, 'base64'), allowInterrupt: r.allowInterrupt === true
     }))
+  }
+
+  // --- open pairings, kept across restarts ---
+  //
+  // A rendezvous id is public and has no expiry, so the only thing that used to end
+  // one was this process exiting — which made "it does not expire" untrue in the way
+  // that matters: share an id, restart, and your friend is answering a rendezvous
+  // nobody is listening on, with nothing to tell them so.
+  //
+  // The agreement key is stored with it. Regenerating it on restore would change the
+  // number this side shows, so a peer holding the old one would see a second entry
+  // appear under the same name with a different number — the exact shape of the
+  // impersonation the comparison exists to catch. It is an ephemeral per-pairing
+  // secret in a store that already holds the room keys and the signing key.
+
+  savePairing (p) {
+    const c = this._config()
+    c.pairings = c.pairings || {}
+    c.pairings[p.id] = {
+      role: p.role,
+      roomId: p.roomId || null,
+      roomName: p.roomName || null,
+      ephPublicKey: b4a.toString(p.eph.publicKey, 'base64'),
+      ephSecretKey: b4a.toString(p.eph.secretKey, 'base64'),
+      nonce: b4a.toString(p.nonce, 'base64')
+    }
+    this._writeJson('config.json', c)
+  }
+
+  pairings () {
+    return Object.entries(this._config().pairings || {}).map(([id, p]) => ({
+      id,
+      role: p.role,
+      roomId: p.roomId || null,
+      roomName: p.roomName || null,
+      eph: {
+        publicKey: b4a.from(p.ephPublicKey, 'base64'),
+        secretKey: b4a.from(p.ephSecretKey, 'base64')
+      },
+      nonce: b4a.from(p.nonce, 'base64')
+    }))
+  }
+
+  removePairing (id) {
+    const c = this._config()
+    if (!c.pairings || !c.pairings[id]) return
+    delete c.pairings[id]
+    this._writeJson('config.json', c)
   }
 
   roomByName (name) {

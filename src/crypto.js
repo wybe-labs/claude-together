@@ -13,6 +13,14 @@ export function generateInviteCode () {
   return `${code.slice(0, 4)}-${code.slice(4, 8)}-${code.slice(8, 12)}`
 }
 
+// Display form: what the user was given and will compare against. Normalizing is for
+// matching only — every id shown back to a human goes through this, so the id in
+// status is the same string they pasted.
+export function formatCode (code) {
+  const c = normalizeCode(code)
+  return c.length === 12 ? `${c.slice(0, 4)}-${c.slice(4, 8)}-${c.slice(8, 12)}` : c
+}
+
 export function normalizeCode (code) {
   return code
     .toUpperCase()
@@ -111,4 +119,85 @@ export function verify (messageBuf, sigBuf, publicKey) {
   } catch {
     return false
   }
+}
+
+// A short, human-comparable form of an identity key. This is what someone actually
+// checks when they want to know they are talking to who they think they are.
+export function fingerprint (publicKey) {
+  const hex = typeof publicKey === 'string' ? publicKey : b4a.toString(publicKey, 'hex')
+  return hex.slice(0, 12).replace(/(.{4})(?=.)/g, '$1-')
+}
+
+// --- SAS pairing: X25519 agreement authenticated by a spoken number ---
+
+// The rendezvous id names a meeting point and is NOT a secret — it can be pasted in
+// a channel, and it never expires on its own. 60 bits of randomness only so two
+// rendezvous never collide and a stranger can't stumble onto one; anyone who learns
+// it can show up, and is then caught by the SAS comparison rather than by secrecy.
+export function generateRendezvousId () {
+  return generateInviteCode()
+}
+
+export function rendezvousTopic (id) {
+  return topicFor(hash(b4a.from(`claude-together-rendezvous-v1|${normalizeCode(id)}`)), 'rendezvous')
+}
+
+export function ephemeralKeyPair () {
+  const secretKey = randomBytes(sodium.crypto_scalarmult_SCALARBYTES)
+  const publicKey = b4a.alloc(sodium.crypto_scalarmult_BYTES)
+  sodium.crypto_scalarmult_base(publicKey, secretKey)
+  return { publicKey, secretKey }
+}
+
+// X25519. Returns null for a degenerate peer key (low order point) rather than a
+// shared secret an attacker chose.
+export function agree (secretKey, peerPublicKey) {
+  if (peerPublicKey.length !== sodium.crypto_scalarmult_BYTES) return null
+  const shared = b4a.alloc(sodium.crypto_scalarmult_BYTES)
+  try {
+    sodium.crypto_scalarmult(shared, secretKey, peerPublicKey)
+  } catch {
+    return null
+  }
+  if (shared.every(byte => byte === 0)) return null
+  return derive(shared, 'claude-together-pair-secret')
+}
+
+// Everything the two sides must agree on, in an order both compute identically
+// (sorted by identity key, so there is no initiator/responder asymmetry). Each
+// side's ephemeral key is bound to its identity key by the signature in pair-hello,
+// so an impostor cannot borrow someone else's identity key here.
+export function pairingTranscript (rendezvousId, a, b) {
+  const [lo, hi] = b4a.compare(a.pk, b.pk) <= 0 ? [a, b] : [b, a]
+  return b4a.concat([
+    b4a.from(`claude-together-sas-v1|${normalizeCode(rendezvousId)}|`),
+    lo.pk, lo.epk, hi.pk, hi.epk
+  ])
+}
+
+// Six digits: a man-in-the-middle who relays the rendezvous must show each side a
+// DIFFERENT number, so their only escape is a 1-in-a-million guess that both humans
+// then read aloud. Not secrecy — detection.
+const SAS_DIGITS = 6
+
+export function sasFrom (transcript) {
+  const h = hash(transcript)
+  let n = 0n
+  for (let i = 0; i < 8; i++) n = (n << 8n) | BigInt(h[i])
+  const digits = (n % (10n ** BigInt(SAS_DIGITS))).toString().padStart(SAS_DIGITS, '0')
+  return `${digits.slice(0, 3)} ${digits.slice(3)}`
+}
+
+export function normalizeSas (sas) {
+  return String(sas).replace(/\D/g, '')
+}
+
+export function helloSignable (rendezvousId, pk, epk, nonce) {
+  return b4a.concat([
+    b4a.from(`claude-together-pair-hello-v1|${normalizeCode(rendezvousId)}|`), pk, epk, nonce
+  ])
+}
+
+export function confirmSignable (transcript) {
+  return b4a.concat([b4a.from('claude-together-pair-confirm-v1|'), transcript])
 }

@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
@@ -34,6 +35,22 @@ export function projectKey (dir = projectDir()) {
 
 export function scopedDir () {
   return process.env.CLAUDE_TOGETHER_DIR || path.join(root(), 'projects', projectKey())
+}
+
+// Every per-project store on this machine, newest name first. Used to find a room you
+// already hold in another project: the key is already here, so copying it locally needs
+// no pairing and grants nothing that was not already granted.
+export function projectStores () {
+  const dir = path.join(root(), 'projects')
+  let names
+  try {
+    names = fs.readdirSync(dir)
+  } catch {
+    return []
+  }
+  return names
+    .map(name => ({ name, dir: path.join(dir, name) }))
+    .filter(entry => fs.existsSync(path.join(entry.dir, 'config.json')))
 }
 
 // Display name stays machine-global — you are the same person in every project.
