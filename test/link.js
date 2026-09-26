@@ -108,6 +108,9 @@ console.log('5. A message from your own other session is labelled as such…')
 // Both projects sign with the machine identity, so this must not be reported as first
 // contact with a stranger — that invites verifying a fingerprint against yourself.
 const ownAtFirst = waitFor(first, 'message', m => m.text === 'from my other project')
+// Subscribe the friend before sending too: it can receive the message before the first
+// session does, and a listener attached after that would wait for an event already gone.
+const atFriend = waitFor(friend, 'message', m => m.text === 'from my other project')
 second.sendMessage('shared-room', 'from my other project')
 const own = await ownAtFirst
 assert.equal(own.auth, 'self', 'our own identity key must not read as a new sender')
@@ -116,7 +119,6 @@ assert.match(own.pk, /^[0-9a-f]{64}$/, 'the signature still travels with it')
 assert.ok(first.store.membersFor(roomId).kacper?.pk, 'the name must still get pinned')
 
 console.log('6. The friend still sees it as an ordinary signed message…')
-const atFriend = waitFor(friend, 'message', m => m.text === 'from my other project')
 const friendCopy = await atFriend
 assert.notEqual(friendCopy.auth, 'self', "someone else's key is not their own")
 assert.ok(['verified', 'verified-new'].includes(friendCopy.auth), `unexpected auth ${friendCopy.auth}`)
