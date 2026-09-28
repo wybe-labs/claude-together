@@ -13,6 +13,7 @@ if that changes this must change with it. Originally from a recipe by Ronny's se
   CLAUDE_STATUSLINE_ASCII=1   plain glyphs, for terminals without good Unicode
   CLAUDE_STATUSLINE_DUMP=1    write the raw payload for inspecting field names
 """
+import getpass
 import hashlib
 import json
 import os
@@ -72,21 +73,29 @@ def ico(name):
 
 def read_json(path, default):
     try:
-        return json.loads(Path(path).read_text())
+        # The store writes UTF-8; utf-8-sig also tolerates a hand-edited file with a BOM.
+        # Without an explicit encoding Windows reads with the locale code page.
+        return json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return default
 
 
 def project_dir(payload):
     workspace = payload.get("workspace") or {}
-    return Path(workspace.get("project_dir") or payload.get("cwd") or os.getcwd()).resolve()
+    # abspath, not resolve(): Node's path.resolve does not follow symlinks or
+    # junctions, and the store key has to be computed from the same string it used.
+    return Path(os.path.abspath(workspace.get("project_dir") or payload.get("cwd") or os.getcwd()))
 
 
 def store_dir(project):
     override = os.environ.get("CLAUDE_TOGETHER_DIR")
     if override:
         return Path(override)
-    digest = hashlib.sha256(str(project).encode("utf-8")).hexdigest()[:12]
+    # Mirrors projectKey() in src/scope.js, including case-folding on case-insensitive
+    # filesystems. Without it, on Windows and macOS this hashed "C:\Users\...\Project"
+    # while the server hashed "c:\users\...\project", and never found the store.
+    key = str(project).lower() if sys.platform in ("win32", "darwin") else str(project)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
     base = re.sub(r"[^A-Za-z0-9._-]", "_", project.name or "root")[:40]
     return Path.home() / ".claude-together" / "projects" / f"{base}-{digest}"
 
@@ -162,29 +171,77 @@ def pr_segment(project, branch):
     """
     if not branch or branch == "HEAD":
         return ""
-    cache = Path.home() / ".claude" / "claude-together-statusline-pr.json"
+    cache = pr_cache_path(project)
     cached = read_json(cache, {})
     fresh = cached.get("branch") == branch and time.time() - cached.get("at", 0) < PR_CACHE_SECONDS
     if not fresh:
-        target = json.dumps(str(cache))
-        refresh = (
-            f'out=$(cd {json.dumps(str(project))} && gh pr view --json number,state,isDraft '
-            f'--jq "{{number:.number,state:.state,draft:.isDraft}}" 2>/dev/null); '
-            f'printf "{{\\"branch\\":%s,\\"at\\":%s,\\"pr\\":%s}}" '
-            f'{json.dumps(json.dumps(branch))} "$(date +%s)" "${{out:-null}}" > {target}.tmp '
-            f'&& mv {target}.tmp {target}'
-        )
-        try:
-            subprocess.Popen(["bash", "-lc", refresh], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-        except OSError:
-            pass
-    pr = cached.get("pr") if fresh else None
+        # Claim the refresh first, so the renders that follow in the next second see a
+        # fresh entry instead of each starting another one.
+        write_json_atomic(cache, {"branch": branch, "at": time.time(),
+                                  "pr": cached.get("pr") if cached.get("branch") == branch else None})
+        spawn_pr_refresh(project, branch, cache)
+    pr = cached.get("pr") if cached.get("branch") == branch else None
     if not pr:
         return ""
     draft = bool(pr.get("draft"))
     tone = AMBER if draft else GREEN
     return f"{tone}{ico('draft') if draft else ico('pr')}{pr['number']}{RESET}"
+
+
+def pr_cache_path(project):
+    """One cache per project: a single shared file meant two repos both on "main"
+    showed each other's PR, and sessions on different branches kept invalidating it."""
+    key = str(project).lower() if sys.platform in ("win32", "darwin") else str(project)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return Path.home() / ".claude" / f"claude-together-statusline-pr-{digest}.json"
+
+
+def write_json_atomic(path, value):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(value), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def spawn_pr_refresh(project, branch, cache):
+    """Refresh the PR cache in a detached copy of this script.
+
+    No shell, on purpose. This used to be `bash -lc "<string>"` with the project path
+    and branch name interpolated into it: a branch named x$(touch${IFS}pwned) is a
+    valid git ref and ran on the first render in a cloned repo. And on Windows,
+    "bash" resolves to WSL's System32\\bash.exe before Git Bash, which read the Windows
+    cache path as a relative Linux filename, wrote junk into the project, and never
+    updated the real cache, so every render started another login shell.
+    """
+    args = [sys.executable, os.path.abspath(__file__), "--refresh-pr", str(project), branch, str(cache)]
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL, "close_fds": True}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(args, **kwargs)
+    except OSError:
+        pass
+
+
+def refresh_pr(project, branch, cache):
+    pr = None
+    try:
+        done = subprocess.run(["gh", "pr", "view", "--json", "number,state,isDraft"],
+                              cwd=project, capture_output=True, text=True, encoding="utf-8",
+                              timeout=20, **({"creationflags": subprocess.CREATE_NO_WINDOW}
+                                             if sys.platform == "win32" else {}))
+        if done.returncode == 0:
+            data = json.loads(done.stdout)
+            pr = {"number": data.get("number"), "state": data.get("state"), "draft": bool(data.get("isDraft"))}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass  # no gh, no PR, offline: cache "no PR" rather than retrying every render
+    write_json_atomic(Path(cache), {"branch": branch, "at": time.time(), "pr": pr})
 
 
 def usage_segments(payload):
@@ -237,7 +294,7 @@ def last_incoming_segment(store, me):
     latest = None
     for log in sorted(logs.glob("*.jsonl")) if logs.is_dir() else []:
         try:
-            lines = log.read_text(errors="replace").splitlines()
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             continue
         for line in lines:
@@ -263,7 +320,12 @@ def together_segments(project):
     config = read_json(store / "config.json", None)
     if config is None:
         return []
-    me = config.get("name") or os.environ.get("USER", "")
+    # The display name lives in the machine-wide identity file, not the project store
+    # (unless CLAUDE_TOGETHER_DIR points everything at one store). $USER is usually
+    # unset on Windows, and wrong for anyone who used set_display_name.
+    identity = config if os.environ.get("CLAUDE_TOGETHER_DIR") else \
+        read_json(Path.home() / ".claude-together" / "config.json", {})
+    me = identity.get("name") or config.get("name") or getpass.getuser()
     return [s for s in (rooms_segment(store, config),
                         unread_segment(store),
                         last_incoming_segment(store, me)) if s]
@@ -344,6 +406,16 @@ DEMOS = {
 
 
 def main():
+    # Claude Code reads the status line from a pipe, and on Windows Python encodes a
+    # pipe with the locale code page (cp1252 here): the first ✦ or peer emoji raised
+    # UnicodeEncodeError and there was no status line at all.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    if len(sys.argv) >= 5 and sys.argv[1] == "--refresh-pr":
+        refresh_pr(sys.argv[2], sys.argv[3], sys.argv[4])
+        return
     if "--demo" in sys.argv:
         for label, payload in DEMOS.items():
             print(f"{GREY}{label}:{RESET}")
@@ -359,7 +431,12 @@ def main():
                 json.dumps(payload, indent=2))
         except OSError:
             pass
-    print(render(payload))
+    # A status line that raises leaves nothing on screen; fall back to the model name.
+    try:
+        line = render(payload)
+    except Exception:
+        line = str((payload.get("model") or {}).get("display_name") or "")
+    print(line)
 
 
 if __name__ == "__main__":
