@@ -257,6 +257,21 @@ export class Together extends EventEmitter {
 
     for (const room of this.store.rooms()) this._joinTopic(topicFor(room.key, 'room'))
 
+    // Legacy invite codes live only in memory. A rebuild (set_bootstrap, set_relay)
+    // stops their timers; bring back the ones still inside their lifetime, announced
+    // on the new swarm, and drop the rest — a code must not outlive what it promised.
+    for (const [hex, inv] of this.pendingInvites) {
+      const left = (inv.expiresAt || 0) - Date.now()
+      if (left <= 0) {
+        this.pendingInvites.delete(hex)
+        continue
+      }
+      clearTimeout(inv.timer)
+      inv.timer = setTimeout(() => this._expireInvite(hex), left)
+      if (inv.timer.unref) inv.timer.unref()
+      this._joinTopic(inv.topic)
+    }
+
     // Rendezvous outlive the process that opened them: an id already shared has to
     // keep working after a restart, or "it does not expire" is only true until someone
     // restarts Claude Code. Peers re-announce themselves, so the peer list rebuilds
@@ -315,32 +330,43 @@ export class Together extends EventEmitter {
   // bootstrap when the swarm is constructed, so the swarm is rebuilt — rooms and open
   // rendezvous come back from the store on the way up, and peers reconnect on their own.
   // Live connections do drop: they belong to the DHT being left behind.
-  async reconfigureBootstrap (nodes) {
+  // apply: false saves the setting for later sessions without touching this one —
+  // for when an environment variable pins this process's value, and switching anyway
+  // would move it to a different DHT while it keeps reporting the pinned one.
+  async reconfigureBootstrap (nodes, { apply = true } = {}) {
     const parsed = parseBootstrap(nodes)
     this.store.setBootstrap(parsed || null)
-    await this._rebuild(() => { this.bootstrap = parsed })
-    return { bootstrap: parsed || null }
+    if (apply) await this._rebuild(() => { this.bootstrap = parsed })
+    return { bootstrap: parsed || null, applied: apply }
   }
 
   // Route through a relay when a direct connection cannot be made. Hyperswarm falls
   // back to it only on a failed punch, so this is a safety net rather than a mode.
-  async reconfigureRelay (key) {
+  async reconfigureRelay (key, { apply = true } = {}) {
     const parsed = parseRelay(key)
     this.store.setRelay(parsed ? b4a.toString(parsed, 'hex') : null)
-    await this._rebuild(() => { this.relay = parsed })
-    return { relay: parsed ? b4a.toString(parsed, 'hex') : null }
+    if (apply) await this._rebuild(() => { this.relay = parsed })
+    return { relay: parsed ? b4a.toString(parsed, 'hex') : null, applied: apply }
   }
 
   // Swarm settings are bound at construction, so changing one means building a new
   // swarm. Rooms and open rendezvous come back from the store on the way up; live
   // connections drop, because they belong to the setup being replaced.
-  async _rebuild (apply) {
-    await this.stop()
-    this.conns.clear()
-    this.roomConns.clear()
-    this.discoveries.clear()
-    apply()
-    await this.start()
+  //
+  // Serialized: two overlapping rebuilds (parallel tool calls, or start_local_bootstrap
+  // racing set_bootstrap) would both stop the same swarm and both start a new one,
+  // leaking a whole swarm and its maintenance timer.
+  _rebuild (apply) {
+    const run = async () => {
+      await this.stop()
+      this.conns.clear()
+      this.roomConns.clear()
+      this.discoveries.clear()
+      apply()
+      await this.start()
+    }
+    this._rebuilding = (this._rebuilding || Promise.resolve()).then(run, run)
+    return this._rebuilding
   }
 
   async stop () {
@@ -353,7 +379,9 @@ export class Together extends EventEmitter {
     }
     this.pendingJoins.clear()
     for (const session of this.pendingPairs.values()) {
-      clearInterval(session.retry)
+      clearTimeout(session.retry)
+      clearTimeout(session.announceTimer)
+      for (const peer of session.peers.values()) clearTimeout(peer.revealTimer)
       session.resolve?.()
     }
     this.pendingPairs.clear()
@@ -418,7 +446,7 @@ export class Together extends EventEmitter {
 
     const timer = setTimeout(() => this._expireInvite(hex), INVITE_TTL_MS)
     if (timer.unref) timer.unref()
-    this.pendingInvites.set(hex, { roomId: room.id, codeKey, timer, topic })
+    this.pendingInvites.set(hex, { roomId: room.id, codeKey, timer, topic, expiresAt: Date.now() + INVITE_TTL_MS })
     this._joinTopic(topic)
     this._reproveAll()
     return { code, roomName: room.name, expiresInMinutes: INVITE_TTL_MS / 60000 }

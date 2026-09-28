@@ -130,6 +130,28 @@ await alice.reconfigureRelay(relayKey)
 await assert.rejects(() => alice.reconfigureRelay('nonsense'), /hex public key/)
 assert.ok(alice.relay, 'a refused change must leave relaying where it was')
 
+console.log('13. With the value pinned elsewhere, a change can be saved without touching this session…')
+const pinnedAt = alice.bootstrap
+const saved = await alice.reconfigureBootstrap(netB.bootstrap.map(b => `${b.host}:${b.port}`), { apply: false })
+assert.equal(saved.applied, false)
+assert.deepEqual(alice.bootstrap, pinnedAt, 'this session stays exactly where it was')
+assert.deepEqual(alice.store.getBootstrap(), netB.bootstrap.map(b => `${b.host}:${b.port}`), 'but the choice is remembered')
+
+console.log('14. Overlapping rebuilds run one after another and leave one swarm…')
+const before = alice.swarm
+await Promise.all([alice.reconfigureRelay(null), alice.reconfigureRelay(relayKey), alice.reconfigureRelay(null)])
+assert.notEqual(alice.swarm, before)
+assert.equal(alice.swarm.destroyed, false, 'the swarm left standing is live')
+assert.equal(alice.relay, undefined, 'the last call wins, as if they had run in order')
+
+console.log('15. A legacy invite code survives a rebuild inside its lifetime…')
+const legacy = alice.createInvite('moving-room')
+await alice.reconfigureRelay(null)
+assert.equal(alice.pendingInvites.size, 1, 'still pending after the swarm was replaced')
+const [inviteHex] = alice.pendingInvites.keys()
+assert.ok(alice.discoveries.has(inviteHex), 'and announced again on the new swarm')
+assert.ok(legacy.code)
+
 await alice.stop()
 await bob.stop()
 await netA.destroy()

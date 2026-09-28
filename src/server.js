@@ -187,13 +187,18 @@ server.registerTool('set_bootstrap', {
       .describe('Bootstrap nodes as host:port, e.g. ["192.168.1.10:49737"]. Omit or pass an empty list to use the public DHT. Must be an address peers can reach, never a hostname that resolves to loopback.')
   }
 }, async ({ nodes }) => {
-  const res = await together.reconfigureBootstrap(nodes && nodes.length ? nodes : null)
-  const note = bootstrapPinnedByEnv
-    ? ' NOTE: CLAUDE_TOGETHER_BOOTSTRAP is set for this process, so it keeps overriding this until Claude Code restarts.'
-    : ''
+  // With the environment variable pinning this process, switching anyway would move it
+  // to a different DHT while status kept reporting the pinned value — the "everyone
+  // looks offline" failure. Save for later sessions and leave this one alone.
+  const res = await together.reconfigureBootstrap(nodes && nodes.length ? nodes : null, { apply: !bootstrapPinnedByEnv })
+  if (!res.applied) {
+    return text(`Saved ${res.bootstrap ? res.bootstrap.join(', ') : 'the public DHT'} as this machine's discovery setting ` +
+      'for future sessions. Nothing changed in THIS session: CLAUDE_TOGETHER_BOOTSTRAP is set in its environment ' +
+      `and pins it to ${describeBootstrap()}. Remove that variable and restart Claude Code to use the saved value.`)
+  }
   return text(res.bootstrap
-    ? `Discovery now bootstraps from ${res.bootstrap.join(', ')} and this is remembered for the machine. Peers must use the same value.${note}`
-    : `Discovery is back on the public hyperdht nodes, and that is remembered for the machine.${note}`)
+    ? `Discovery now bootstraps from ${res.bootstrap.join(', ')} and this is remembered for the machine. Peers must use the same value.`
+    : 'Discovery is back on the public hyperdht nodes, and that is remembered for the machine.')
 })
 
 server.registerTool('start_local_bootstrap', {
@@ -221,7 +226,12 @@ server.registerTool('start_local_bootstrap', {
   // Give it a moment to bind before pointing discovery at it, so the first lookup has
   // something to talk to rather than failing and waiting for a retry.
   await new Promise(resolve => setTimeout(resolve, 2000))
-  const res = await together.reconfigureBootstrap([`${host}:${bootPort}`])
+  const res = await together.reconfigureBootstrap([`${host}:${bootPort}`], { apply: !bootstrapPinnedByEnv })
+  if (!res.applied) {
+    return text(`Local DHT cluster running on ${host}:${bootPort} (pid ${child.pid}), saved as this machine's discovery ` +
+      'setting for future sessions — but THIS session stays where CLAUDE_TOGETHER_BOOTSTRAP pins it ' +
+      `(${describeBootstrap()}). Remove that variable and restart Claude Code to use the cluster.`)
+  }
   return text(
     `Local DHT cluster running on ${host}:${bootPort} (pid ${child.pid}), and discovery now uses it.\n` +
     `Everyone who should meet you needs CLAUDE_TOGETHER_BOOTSTRAP=${host}:${bootPort}, or the same set via set_bootstrap. ` +
@@ -256,15 +266,17 @@ server.registerTool('set_relay', {
       .describe('Relay public key, 64 hex characters. Omit to stop relaying.')
   }
 }, async ({ key }) => {
-  const res = await together.reconfigureRelay(key || null)
-  const note = relayPinnedByEnv
-    ? ' NOTE: CLAUDE_TOGETHER_RELAY is set for this process, so it keeps overriding this until Claude Code restarts.'
-    : ''
+  const res = await together.reconfigureRelay(key || null, { apply: !relayPinnedByEnv })
+  if (!res.applied) {
+    return text(`Saved ${res.relay ? 'relay ' + res.relay.slice(0, 16) + '…' : '"no relay"'} for future sessions. ` +
+      'Nothing changed in THIS session: CLAUDE_TOGETHER_RELAY is set in its environment and keeps its value. ' +
+      'Remove that variable and restart Claude Code to use the saved setting.')
+  }
   return text(res.relay
     ? `Connections that cannot be made directly will now be relayed through ${res.relay.slice(0, 16)}…, ` +
       'remembered for this machine. Direct connections are still tried first and preferred; the relay only ' +
-      'carries what would otherwise fail. It learns who talks to whom and when, though not what is said.' + note
-    : `Relaying is off. A connection that cannot be made directly will simply not be made.${note}`)
+      'carries what would otherwise fail. It learns who talks to whom and when, though not what is said.'
+    : 'Relaying is off. A connection that cannot be made directly will simply not be made.')
 })
 
 server.registerTool('link_room', {
