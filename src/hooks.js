@@ -21,9 +21,29 @@ export const HOOK_EVENTS = ['PostToolUse', 'Stop', 'UserPromptSubmit']
 export function isOurs (command, hookScript = HOOK_SCRIPT) {
   const c = String(command || '')
   if (hookScript && c.includes(hookScript)) return true
-  const norm = c.toLowerCase().replace(/-/g, '')
-  return norm.includes('claudetogether') && norm.includes('hook.js')
+  // Fallback: exactly the shape of command we install — .../scripts/hook.js followed by
+  // one of our three modes — in a folder whose name reads claude-together. Before, any
+  // command containing "claudetogether" and "hook.js" matched, so a project hook such
+  // as ClaudeTogether/.claude/hooks/lint-hook.js would have been removed as ours.
+  return /claude-?together[\\/](?:.*[\\/])?scripts[\\/]hook\.js"?\s+(posttool|stop|prompt)\s*$/i.test(c)
 }
+
+// Settings files are edited by hand and by other tools. Some Windows editors (and
+// PowerShell 5's Out-File/Set-Content) write a UTF-8 byte-order mark, which JSON.parse
+// rejects; treat it as the formatting noise it is.
+export function readSettingsText (settingsPath) {
+  return fs.readFileSync(settingsPath, 'utf8').replace(/^\uFEFF/, '')
+}
+
+// Write-then-rename, so a crash or a concurrent write (Claude Code rewrites the user
+// settings file itself) can never leave a truncated settings file behind.
+export function writeSettingsAtomic (settingsPath, settings) {
+  const tmp = `${settingsPath}.${process.pid}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(settings, null, 2))
+  fs.renameSync(tmp, settingsPath)
+}
+
+const eventEntries = (settings, event) => (Array.isArray(settings?.hooks?.[event]) ? settings.hooks[event] : [])
 
 // Returns the events our hooks cover, or an unreadable marker. A settings file that
 // will not parse is not evidence that hooks are absent, and saying "no hooks" there
@@ -33,12 +53,12 @@ function eventsIn (settingsPath) {
   if (!fs.existsSync(settingsPath)) return []
   let settings
   try {
-    settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
+    settings = JSON.parse(readSettingsText(settingsPath))
   } catch (err) {
     return { unreadable: err.message }
   }
   return HOOK_EVENTS.filter(event =>
-    (settings.hooks?.[event] || []).some(e => (e.hooks || []).some(h => isOurs(h.command))))
+    eventEntries(settings, event).some(e => Array.isArray(e?.hooks) && e.hooks.some(h => isOurs(h?.command))))
 }
 
 // Reports where delivery hooks were found for this project, and whether all three
@@ -90,7 +110,7 @@ export function hooksStatus (dir = projectDir()) {
     events: [],
     summary: 'NO delivery hooks for this project — incoming messages will NOT appear on ' +
       'their own, they wait in the inbox until check_messages is called. Tell your user, ' +
-      `and to fix it: run "npm --prefix ${PKG_ROOT} run register" in this project, then ` +
+      `and to fix it: run npm --prefix "${PKG_ROOT}" run register from this project, then ` +
       'restart Claude Code.'
   }
 }

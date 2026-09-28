@@ -118,7 +118,56 @@ assert.equal(broken.installed, false)
 assert.match(broken.summary, /cannot tell/, 'a file we cannot read is not proof hooks are absent')
 assert.match(broken.summary, /not valid JSON/)
 
-for (const d of [fakeHome, projectA, projectB, projectC, projectD]) {
+console.log('11. Registration targets the directory npm was called from, not the checkout…')
+const { registrationTarget } = await import('../src/scope.js')
+const savedEnv = { CLAUDE_PROJECT_DIR: process.env.CLAUDE_PROJECT_DIR, INIT_CWD: process.env.INIT_CWD }
+delete process.env.CLAUDE_PROJECT_DIR
+process.env.INIT_CWD = projectB
+assert.equal(registrationTarget(), path.resolve(projectB), 'npm --prefix <checkout> run register from projectB')
+process.env.CLAUDE_PROJECT_DIR = projectA
+assert.equal(registrationTarget(), path.resolve(projectA), 'an explicit CLAUDE_PROJECT_DIR still wins')
+for (const [k, v] of Object.entries(savedEnv)) { if (v === undefined) delete process.env[k]; else process.env[k] = v }
+
+console.log('12. A settings file saved with a byte-order mark is read, not rejected…')
+const projectE = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-projE-'))
+fs.mkdirSync(path.join(projectE, '.claude'), { recursive: true })
+fs.writeFileSync(settingsOf(projectE), '\uFEFF' + JSON.stringify({ permissions: { allow: ['Bash(ls)'] } }))
+installHooks(projectE)
+assert.deepEqual(readJson(settingsOf(projectE)).permissions, { allow: ['Bash(ls)'] })
+assert.equal(hooksStatus(projectE).complete, true)
+assert.deepEqual(fs.readdirSync(path.join(projectE, '.claude')).filter(f => f.endsWith('.tmp')), [],
+  'writes go through a temp file that is renamed into place, never left behind')
+
+console.log('13. One of our commands in a shared group is removed without taking its neighbours…')
+fs.writeFileSync(userSettings, JSON.stringify({
+  hooks: {
+    Stop: [{ hooks: [
+      { type: 'command', command: '"/usr/bin/node" "/home/x/claude-together/scripts/hook.js" stop' },
+      { type: 'command', command: 'echo shares-a-group-with-ours' }
+    ] }],
+    PreToolUse: { not: 'a list' }
+  }
+}, null, 2))
+assert.deepEqual(removeUserWideHooks().events, ['Stop'])
+const shared = readJson(userSettings)
+assert.equal(shared.hooks.Stop[0].hooks.length, 1)
+assert.match(shared.hooks.Stop[0].hooks[0].command, /shares-a-group-with-ours/)
+assert.deepEqual(shared.hooks.PreToolUse, { not: 'a list' }, 'a malformed entry is left alone, not thrown away')
+
+console.log('14. A project hook that merely lives under a claude-together folder is not ours…')
+fs.writeFileSync(userSettings, JSON.stringify({
+  hooks: { Stop: [{ hooks: [{ type: 'command', command: 'node C:\\Users\\e\\ClaudeTogether\\.claude\\hooks\\lint-hook.js' }] }] }
+}, null, 2))
+assert.deepEqual(removeUserWideHooks().events, [], 'lint-hook.js must survive')
+
+console.log('15. A hooks entry that is not a list stops install with a reason instead of being overwritten…')
+const projectF = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-projF-'))
+fs.mkdirSync(path.join(projectF, '.claude'), { recursive: true })
+fs.writeFileSync(settingsOf(projectF), JSON.stringify({ hooks: { Stop: { mine: true } } }))
+assert.throws(() => installHooks(projectF), /hooks\.Stop is not a list/)
+assert.deepEqual(readJson(settingsOf(projectF)).hooks.Stop, { mine: true })
+
+for (const d of [fakeHome, projectA, projectB, projectC, projectD, projectE, projectF]) {
   fs.rmSync(d, { recursive: true, force: true })
 }
 console.log('\nAll per-project registration tests passed.')

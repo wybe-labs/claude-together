@@ -12,11 +12,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { installHooks, removeUserWideHooks } from './install-hooks.js'
-import { projectDir } from '../src/scope.js'
+import { registrationTarget } from '../src/scope.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const server = path.join(root, 'src', 'server.js')
-const project = projectDir()
+const project = registrationTarget()
 
 if (project === root) {
   console.error(`Refusing to register: this looks like the claude-together checkout itself (${root}).`)
@@ -36,10 +36,17 @@ try {
   console.error('Messages will still arrive, but only via /together-inbox.')
 }
 
-const { settingsPath: userSettings, events } = removeUserWideHooks()
-if (events.length > 0) {
-  console.log(`\nRemoved old user-wide hooks (${events.join(', ')}) from ${userSettings}.`)
-  console.log('Those fired in every project on this machine. Re-run this in each project you want.')
+// A broken user settings file must not stop the rest: this used to throw here, after
+// the project hooks were in but before the commands and the MCP server were.
+try {
+  const { settingsPath: userSettings, events } = removeUserWideHooks()
+  if (events.length > 0) {
+    console.log(`\nRemoved old user-wide hooks (${events.join(', ')}) from ${userSettings}.`)
+    console.log('Those fired in every project on this machine. Re-run this in each project you want.')
+  }
+} catch (err) {
+  console.error(`\nCould not check for old user-wide hooks: ${err.message}`)
+  console.error('Continuing — this only matters if a pre-0.4 install left hooks there.')
 }
 
 // Install the /together-* slash commands for this project only.
@@ -54,8 +61,21 @@ console.log(`\nInstalled slash commands to ${cmdDst}: ${cmdFiles.map(f => '/' + 
 
 const args = ['mcp', 'add', '--scope', 'local', 'claude-together', '--', process.execPath, server]
 
+// On Windows the CLI is a .cmd or .exe that only cmd.exe resolves. Handing Node
+// shell: true joined the arguments with spaces, unquoted, so "C:\Program Files\nodejs\
+// node.exe" (or a checkout under "New folder") arrived as several arguments, claude
+// exited 0, and a server that could never start was registered with no error shown.
+// Build the command line ourselves and quote every argument that needs it.
+function winArg (arg) {
+  if (arg.includes('"')) throw new Error(`cannot pass an argument containing a double quote to cmd.exe: ${arg}`)
+  return /[\s&()^|<>%!,;=]/.test(arg) ? `"${arg}"` : arg
+}
 const isWin = process.platform === 'win32'
-const res = spawnSync(isWin ? 'claude.cmd' : 'claude', args, { stdio: 'inherit', cwd: project, shell: isWin })
+const res = isWin
+  ? spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"claude ${args.map(winArg).join(' ')}"`], {
+      stdio: 'inherit', cwd: project, windowsVerbatimArguments: true
+    })
+  : spawnSync('claude', args, { stdio: 'inherit', cwd: project })
 
 if (res.error || res.status !== 0) {
   console.error('\nCould not run the `claude` CLI automatically. Register manually from that project with:\n')

@@ -15,15 +15,33 @@ import path from 'node:path'
 import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { projectDir } from '../src/scope.js'
-import { isOurs, HOOK_SCRIPT } from '../src/hooks.js'
+import { isOurs, HOOK_SCRIPT, readSettingsText, writeSettingsAtomic } from '../src/hooks.js'
 
 function readSettings (settingsPath) {
   if (!fs.existsSync(settingsPath)) return {}
   try {
-    return JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
+    return JSON.parse(readSettingsText(settingsPath))
   } catch (err) {
     throw new Error(`${settingsPath} exists but is not valid JSON — fix it first (${err.message})`)
   }
+}
+
+// Remove only our hook commands from a list of hook groups. A group can hold several
+// commands; dropping the whole group because one of them was ours would silently take
+// the user's own hooks with it. A group is removed only once nothing is left in it.
+function withoutOurs (groups, hookScript) {
+  const kept = []
+  let removed = false
+  for (const group of groups) {
+    if (!group || !Array.isArray(group.hooks)) {
+      kept.push(group)
+      continue
+    }
+    const hooks = group.hooks.filter(h => !isOurs(h?.command, hookScript))
+    if (hooks.length !== group.hooks.length) removed = true
+    if (hooks.length > 0) kept.push(hooks.length === group.hooks.length ? group : { ...group, hooks })
+  }
+  return { kept, removed }
 }
 
 export function installHooks (target = projectDir()) {
@@ -42,13 +60,14 @@ export function installHooks (target = projectDir()) {
 
   settings.hooks = settings.hooks || {}
   for (const [event, entries] of Object.entries(wanted)) {
-    const existing = settings.hooks[event] || []
-    const others = existing.filter(e =>
-      !(e.hooks || []).some(h => isOurs(h.command, hookScript)))
-    settings.hooks[event] = [...others, ...entries]
+    const existing = settings.hooks[event] ?? []
+    if (!Array.isArray(existing)) {
+      throw new Error(`${settingsPath}: hooks.${event} is not a list — fix it by hand first rather than have it overwritten`)
+    }
+    settings.hooks[event] = [...withoutOurs(existing, hookScript).kept, ...entries]
   }
 
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  writeSettingsAtomic(settingsPath, settings)
   return settingsPath
 }
 
@@ -63,13 +82,14 @@ export function removeUserWideHooks () {
   const settings = readSettings(settingsPath)
   const events = []
   for (const [event, entries] of Object.entries(settings.hooks || {})) {
-    const kept = entries.filter(e => !(e.hooks || []).some(h => isOurs(h.command, hookScript)))
-    if (kept.length === entries.length) continue
+    if (!Array.isArray(entries)) continue // not ours to fix, and not ours to throw away
+    const { kept, removed } = withoutOurs(entries, hookScript)
+    if (!removed) continue
     events.push(event)
     if (kept.length > 0) settings.hooks[event] = kept
     else delete settings.hooks[event]
   }
-  if (events.length > 0) fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  if (events.length > 0) writeSettingsAtomic(settingsPath, settings)
   return { settingsPath, events }
 }
 

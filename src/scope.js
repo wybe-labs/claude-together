@@ -18,6 +18,14 @@ export function root () {
   return path.join(os.homedir(), '.claude-together')
 }
 
+// The project a registration is for. npm always runs a package script from the
+// package's own folder, so process.cwd() is this checkout wherever you ran
+// "npm --prefix <checkout> run register" from — which made the documented command
+// refuse every time. npm records the caller's directory in INIT_CWD.
+export function registrationTarget () {
+  return path.resolve(process.env.CLAUDE_PROJECT_DIR || process.env.INIT_CWD || process.cwd())
+}
+
 export function projectDir () {
   return path.resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd())
 }
