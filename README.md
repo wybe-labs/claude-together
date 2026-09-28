@@ -23,10 +23,15 @@ Built on [Hyperswarm](https://github.com/holepunchto/hyperswarm): peers find eac
 through a public BitTorrent-style DHT, hole-punch a direct UDP connection, and talk over
 Noise-encrypted sockets. Exposed to Claude as an [MCP](https://modelcontextprotocol.io) server.
 
-**Current release: v0.4.0** — SAS pairing (no invite secret), per-project
-registration, receiver-side interrupt opt-in, and private-network bootstrap.
-**Wire-incompatible with 0.3.x pairing:** both sides must be on 0.4 to pair.
-Peers on mismatched versions detect and report it in-session.
+**Current release: v0.4.1.** It adds SAS pairing (no invite secret), a relay fallback for
+networks that refuse to hole-punch, per-project registration, receiver-side interrupt
+opt-in, private-network bootstrap and a status line. Most of 0.4 is the work of
+[Kacper Wysocki](https://github.com/comotion) (see [Contributors](#contributors)).
+0.4.1 hardens it: pairing numbers now come from a commit–reveal exchange, so a
+man-in-the-middle can't force them to match.
+**Wire compatibility:** both sides need **0.4.1** to pair. A 0.4.0 peer is refused with a
+reason, because its pairing can be forged. To reach a 0.3.x peer, use
+`create_legacy_invite`. Rooms you are already in keep working across all of these.
 
 ### ▶ 30-second explainer
 
@@ -228,16 +233,29 @@ six digits to each other** is what authenticates the exchange:
    Noise-encrypted socket.
 2. Each sends its long-lived **ed25519 identity key** together with a fresh **X25519**
    key, signed — so an ephemeral key cannot be offered under someone else's identity.
-3. Both derive the same **six-digit number** from the transcript (both identity keys,
-   both ephemeral keys, the id), ordered so each side computes it identically.
-4. The humans compare that number out of band. On confirmation, the inviter encrypts
+3. Each then **commits** to a fresh 32-byte random value (sends its hash, bound to its
+   keys), and reveals the value only after the other side's commitment has arrived.
+4. Both derive the same **six-digit number** from the transcript (both identity keys,
+   both ephemeral keys, both revealed values, the id), ordered so each side computes it
+   identically.
+5. The humans compare that number out of band. On confirmation, the inviter encrypts
    the room's random **256-bit key** to the X25519 secret they agreed.
 
 A man-in-the-middle has to substitute its own key toward at least one side to read
-anything — which changes the number that side sees, so the comparison fails. Relaying
-the real keys untouched keeps the numbers matching but leaves the attacker without the
-agreed secret, so the room key stays unreadable. Its only escape is guessing which
-six digits to show, at 1-in-a-million, against two people about to say them aloud.
+anything. Relaying the real keys untouched keeps the numbers matching but leaves the
+attacker without the agreed secret, so the room key stays unreadable.
+
+The commitment round (step 3) is what makes the six digits mean something. Without it,
+as in 0.4.0, the number depends only on keys, and an attacker holding both sides' keys
+can generate its own until the two numbers match: about a million tries, a few seconds
+of work. With it, every value that feeds the number is fixed before anyone can see the
+others, so each side's number is random and out of the attacker's control.
+
+The attacker has one move left: see our value, walk away without revealing its own, and
+try again. Each walk-away is counted. The humans are warned at 5, and the rendezvous
+closes itself at 20, which caps an attacker's chance at 20 in a million. An honest
+peer reveals within milliseconds, so these only pile up from connection trouble or
+from probing.
 
 **This shifts the burden onto the comparison.** Rubber-stamping the number without
 actually checking it removes the entire protection — the number must be exchanged on a
@@ -247,15 +265,17 @@ human act; Claude is told never to perform it on your behalf.
 
 An open rendezvous is kept in the store, so it survives restarting Claude Code: an id
 you shared yesterday still works today, and only completing it or `cancel_pairing` ends
-it. The agreement key is stored with it, so the number this side shows does not change
-across a restart — otherwise a peer still holding the old number would see a second
-entry appear under the same name with a different number, which is exactly the shape of
-the impersonation the comparison is there to catch.
+it. The number itself is new for every connection, since each exchange commits to fresh
+values. A peer that reconnects gets a new number, and the notice says so. An exchange
+ends with its connection, so a stale number is never left beside the current one.
 
-Multiple peers may answer the same public rendezvous — that is expected, not an attack
-in itself. Each gets its own number, `status` lists them side by side with the name,
-host and key fingerprint, and confirming a number is what selects which one you paired
-with.
+Multiple peers may answer the same public rendezvous. That's expected, not an attack in
+itself. Each gets its own number, `status` lists them side by side with the name, host
+and key fingerprint, and confirming a number is what selects which one you paired
+with. Names and hosts are whatever the peer claims. They are stripped down to plain
+text and quoted as such, and they can never contain a run of digits shaped like the
+number being compared. The inviter only answers hellos naming its own id, so a
+connection never learns about any other rendezvous you have open.
 
 ## Security model
 
@@ -448,13 +468,42 @@ sudo loginctl enable-linger $USER    # or it only runs while you are logged in
 - [`scripts/link-room.js`](scripts/link-room.js) — add a working directory to a room
   this machine already holds, without a session in it
 - [`test/smoke.js`](test/smoke.js) — end-to-end test on a local DHT testnet: `npm test`
+- [`test/syntax.js`](test/syntax.js) — every source file parses (runs first in `npm test`)
 - [`test/pairing.js`](test/pairing.js) — SAS pairing and identity pinning
+- [`test/pairing-commit.js`](test/pairing-commit.js) — the commit–reveal exchange against a
+  hostile peer: walk-aways counted and capped, bad reveals refused, v1 peers refused,
+  steering names neutralized
 - [`test/pairing-restart.js`](test/pairing-restart.js) — a rendezvous outliving the process
 - [`test/interrupts.js`](test/interrupts.js) — receiver-side interrupt opt-in
 - [`test/outbox.js`](test/outbox.js) — at-least-once retry of queued messages
 - [`test/link.js`](test/link.js) — a second working directory joining a room locally
 - [`test/bootstrap.js`](test/bootstrap.js) — repointing discovery while the session runs
 - [`test/register.js`](test/register.js) — per-project hook installation
+
+## Status line
+
+`scripts/statusline.py` shows the model, branch, open PR, usage gauges, and this
+project's rooms, unread count and latest message. Point Claude Code at it in
+`~/.claude/settings.json`:
+
+```json
+{ "statusLine": { "type": "command", "command": "python \"/path/to/claude-together/scripts/statusline.py\"" } }
+```
+
+On Windows use `python` (or `py -3`). `python3` there is usually the Microsoft Store
+stub. Run it with `--demo` to preview. PR numbers come from `gh`, when it's installed,
+refreshed in the background and cached per project.
+
+## Contributors
+
+- **[Einar Holt](https://github.com/wybe-labs)** at Wybe Labs, the R&D arm of Wybe
+  Robotics. Original author.
+- **[Kacper Wysocki](https://github.com/comotion)** wrote most of 0.4 in
+  [his fork](https://github.com/comotion/claude-together): pairing by comparing a number
+  instead of sharing a secret, rendezvous that survive a restart, the relay fallback,
+  private DHT bootstrap and local clusters, per-project registration, interrupt opt-in
+  per room, `link_room`, retrying queued messages, rejection reasons, and the status
+  line. Thank you, Kacper.
 
 ## License
 
