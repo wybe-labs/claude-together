@@ -253,6 +253,10 @@ export class Together extends EventEmitter {
     // restarts Claude Code. Peers re-announce themselves, so the peer list rebuilds
     // itself; only the session has to come back.
     for (const saved of this.store.pairings()) {
+      if (normalizeCode(saved.id).length !== 12) {
+        this.store.removePairing(saved.id) // a malformed id could never be answered or cancelled
+        continue
+      }
       const topic = rendezvousTopic(saved.id)
       const hex = b4a.toString(topic, 'hex')
       const session = {
@@ -270,12 +274,7 @@ export class Together extends EventEmitter {
       }
       this.pendingPairs.set(hex, session)
       this._joinTopic(topic)
-      if (session.role === 'joiner') {
-        session.retry = setInterval(() => {
-          this.discoveries.get(hex)?.refresh().catch(() => {})
-        }, 4_000)
-        if (session.retry.unref) session.retry.unref()
-      }
+      if (session.role === 'joiner') this._startJoinLookups(session)
     }
 
     // Hyperswarm's own DHT re-query cadence is ~10 minutes; that's too slow for
@@ -683,7 +682,8 @@ export class Together extends EventEmitter {
     this.pendingPairs.set(hex, session)
     this.store.savePairing(session)
     this._joinTopic(topic)
-    for (const conn of this.conns) this._sendPairHello(conn, session)
+    // No hello goes out from here: an inviter only answers a hello that names this id,
+    // so a connection never learns about rendezvous it was not given.
     return { id, roomName: room.name }
   }
 
@@ -691,6 +691,9 @@ export class Together extends EventEmitter {
   // the rendezvous stays open either way, and a peer arriving later is announced
   // through the inbox. There is no failure deadline to miss.
   joinRendezvous (id, { firstLookMs = 20_000 } = {}) {
+    if (normalizeCode(String(id || '')).length !== 12) {
+      return Promise.reject(new Error(`"${String(id).slice(0, 40)}" is not a rendezvous id — expect 12 characters like X7KQ-2MPF-3HV9`))
+    }
     const existing = this._pairSessionFor(id)
     if (existing) return Promise.resolve(this._pairingView(existing))
 
@@ -710,12 +713,7 @@ export class Together extends EventEmitter {
     this.pendingPairs.set(hex, session)
     this.store.savePairing(session)
     this._joinTopic(topic)
-    // The other side's announce may land after our first query, and hyperswarm's own
-    // refresh cadence is minutes. Keep looking for as long as the rendezvous is open.
-    session.retry = setInterval(() => {
-      this.discoveries.get(hex)?.refresh().catch(() => {})
-    }, 4_000)
-    if (session.retry.unref) session.retry.unref()
+    this._startJoinLookups(session)
     for (const conn of this.conns) this._sendPairHello(conn, session)
 
     return new Promise(resolve => {
@@ -766,8 +764,22 @@ export class Together extends EventEmitter {
     return { id: session.id }
   }
 
+  // A joiner looks the rendezvous up again on a backoff: quickly at first (the
+  // inviter's announce may land after our first query, and hyperswarm's own refresh
+  // is minutes), then less and less often, so a rendezvous nobody answers does not
+  // poll the DHT every few seconds for as long as it stays open — which is forever.
+  _startJoinLookups (session, delay = 4_000) {
+    clearTimeout(session.retry)
+    session.retry = setTimeout(() => {
+      if (this.pendingPairs.get(session.hex) !== session) return
+      this.discoveries.get(session.hex)?.refresh().catch(() => {})
+      this._startJoinLookups(session, Math.min(delay * 2, 5 * 60_000))
+    }, delay)
+    if (session.retry.unref) session.retry.unref()
+  }
+
   _closePairing (session) {
-    clearInterval(session.retry)
+    clearTimeout(session.retry)
     clearTimeout(session.announceTimer)
     for (const peer of session.peers.values()) clearTimeout(peer.revealTimer)
     this.pendingPairs.delete(session.hex)
@@ -796,6 +808,7 @@ export class Together extends EventEmitter {
       harness: harnessName(),
       v: VERSION,
       sas: SAS_PROTOCOL,
+      role: session.role,
       sig: b4a.toString(sign(helloSignable(session.id, pk, epk, session.nonce), this.keys.secretKey), 'hex')
     })
   }
@@ -862,10 +875,13 @@ export class Together extends EventEmitter {
       conn.destroy()
     }, AUTH_TIMEOUT_MS)
 
-    // Rendezvous ids are public, so there is nothing to withhold until the peer
-    // proves something: announce our open rendezvous and let the SAS sort out who
-    // actually answered.
-    for (const session of this.pendingPairs.values()) this._sendPairHello(conn, session)
+    // A joiner speaks first, naming the id it was given; an inviter only answers. The
+    // ids are not secrets, but announcing every open rendezvous to every connection
+    // handed anyone who answered one of them all the others (and our identity with
+    // each), and filled room peers' logs with hellos meant for someone else.
+    for (const session of this.pendingPairs.values()) {
+      if (session.role === 'joiner') this._sendPairHello(conn, session)
+    }
 
     conn.on('data', data => {
       state.buf += b4a.toString(data)
@@ -1042,9 +1058,16 @@ export class Together extends EventEmitter {
       case 'pair-hello': {
         const session = this._pairSessionFor(msg.id)
         if (!session) {
-          this._pairReject('no rendezvous open with that id here', { theirId: String(msg.id || '').slice(0, 32) })
+          // A joiner greets every connection it has, room peers included. Only a
+          // stranger's hello for an unknown id is worth a line in status.
+          if (state.rooms.size === 0) {
+            this._pairReject('no rendezvous open with that id here', { theirId: peerText(msg.id, 20) })
+          }
           return
         }
+        // Two people answering the same public id meet each other too. Neither can
+        // grant anything, so a number between them would only be noise.
+        if (msg.role === session.role) return
         if (session.granted) {
           this._pairReject('rendezvous already completed', { id: session.id })
           return

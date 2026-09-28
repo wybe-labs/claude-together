@@ -176,6 +176,20 @@ const rej = alice.pairRejections[alice.pairRejections.length - 1]
 assert.equal(rej.peerVersion, 'unknown')
 assert.ok(JSON.stringify(alice.pairRejections).length < 20_000)
 
+console.log('10. An inviter never volunteers its open rendezvous to a new connection…')
+const curious = fakePeer('curious')
+assert.ok(alice.status().pendingPairings.length >= 1, 'alice has rendezvous open')
+assert.equal(curious.last('pair-hello'), undefined, 'but a fresh connection learns none of their ids')
+
+console.log('11. A second inviter-role peer at the same id gets nothing to compare…')
+const sameRole = fakePeer('another-inviter')
+sameRole.feed({ t: 'pair-hello', id: third.id, role: 'inviter' })
+assert.equal(sameRole.last('pair-commit'), undefined)
+
+console.log('12. A malformed id is refused rather than opening a rendezvous nobody can close…')
+await assert.rejects(alice.joinRendezvous('----'), /not a rendezvous id/)
+assert.ok(!alice.status().pendingPairings.some(p => p.id === '----'))
+
 await alice.stop()
 await testnet.destroy()
 console.log('\nAll pairing commitment tests passed.')
