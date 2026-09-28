@@ -163,21 +163,40 @@ export function agree (secretKey, peerPublicKey) {
   return derive(shared, 'claude-together-pair-secret')
 }
 
+// Commitment to a pairing exchange's random value, bound to the committing side's
+// identity and agreement keys so it cannot be transplanted into someone else's hello.
+//
+// Why this exists: a six-digit number over the keys alone can be forged. A
+// man-in-the-middle holding both sides' hellos just generates agreement keys until
+// the number it shows Alice equals the number it shows Bob — about a million tries,
+// a few seconds of work, and offline at that, since a rendezvous key is long-lived.
+// With every side committed to a fresh random value BEFORE it sees the other's, and
+// the number derived from both values, nobody can steer it: the attacker's only
+// move is to walk away after seeing our value and try again, and the transport
+// counts and caps those walk-aways.
+export function sasCommitment (rendezvousId, pk, epk, r) {
+  return hash(b4a.concat([
+    b4a.from(`claude-together-sas-commit-v2|${normalizeCode(rendezvousId)}|`), pk, epk, r
+  ]))
+}
+
 // Everything the two sides must agree on, in an order both compute identically
 // (sorted by identity key, so there is no initiator/responder asymmetry). Each
 // side's ephemeral key is bound to its identity key by the signature in pair-hello,
-// so an impostor cannot borrow someone else's identity key here.
+// so an impostor cannot borrow someone else's identity key here. v2 folds in both
+// sides' committed random values (see sasCommitment).
 export function pairingTranscript (rendezvousId, a, b) {
   const [lo, hi] = b4a.compare(a.pk, b.pk) <= 0 ? [a, b] : [b, a]
   return b4a.concat([
-    b4a.from(`claude-together-sas-v1|${normalizeCode(rendezvousId)}|`),
-    lo.pk, lo.epk, hi.pk, hi.epk
+    b4a.from(`claude-together-sas-v2|${normalizeCode(rendezvousId)}|`),
+    lo.pk, lo.epk, lo.r, hi.pk, hi.epk, hi.r
   ])
 }
 
-// Six digits: a man-in-the-middle who relays the rendezvous must show each side a
-// DIFFERENT number, so their only escape is a 1-in-a-million guess that both humans
-// then read aloud. Not secrecy — detection.
+// Six digits: with commitments in place, the number each side shows is uniformly
+// random and fixed before anyone can influence it, so a man-in-the-middle shows
+// the two humans DIFFERENT numbers except with probability one in a million per
+// completed exchange. Not secrecy — detection.
 const SAS_DIGITS = 6
 
 export function sasFrom (transcript) {

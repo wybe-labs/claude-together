@@ -8,7 +8,7 @@
     "start": "node src/server.js",
     "register": "node scripts/register.js",
     "bootstrap-node": "node scripts/bootstrap-node.js",
-    "test": "node test/scope.js && node test/register.js && node test/smoke.js && node test/interrupts.js && node test/pairing.js && node test/pairing-restart.js && node test/outbox.js && node test/link.js && node test/bootstrap.js",
+    "test": "node test/scope.js && node test/register.js && node test/smoke.js && node test/interrupts.js && node test/pairing.js && node test/pairing-commit.js && node test/pairing-restart.js && node test/outbox.js && node test/link.js && node test/bootstrap.js",
     "test:security": "node test/security.js",
     "test:live": "node test/live.js"
   },

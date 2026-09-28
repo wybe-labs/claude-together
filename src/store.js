@@ -233,11 +233,12 @@ export class Store {
   // that matters: share an id, restart, and your friend is answering a rendezvous
   // nobody is listening on, with nothing to tell them so.
   //
-  // The agreement key is stored with it. Regenerating it on restore would change the
-  // number this side shows, so a peer holding the old one would see a second entry
-  // appear under the same name with a different number — the exact shape of the
-  // impersonation the comparison exists to catch. It is an ephemeral per-pairing
-  // secret in a store that already holds the room keys and the signing key.
+  // The agreement key is stored with it, so the rendezvous keeps one identity across a
+  // restart. The number itself does not survive a restart and should not: since the v2
+  // exchange every connection commits to fresh random values, so a reconnect shows a
+  // new number, and an exchange cannot outlive its connection (a stale entry is dropped
+  // rather than shown beside the new one). It is an ephemeral per-pairing secret in a
+  // store that already holds the room keys and the signing key.
 
   savePairing (p) {
     const c = this._config()

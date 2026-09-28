@@ -12,7 +12,8 @@ import {
   generateInviteCode, deriveCodeKey, derive, topicFor,
   randomBytes, mac, seal, open, timingSafeEqual, hash, sign, verify,
   generateRendezvousId, rendezvousTopic, ephemeralKeyPair, agree, pairingTranscript,
-  sasFrom, normalizeSas, normalizeCode, formatCode, helloSignable, confirmSignable, fingerprint
+  sasFrom, normalizeSas, normalizeCode, formatCode, helloSignable, confirmSignable, fingerprint,
+  sasCommitment
 } from './crypto.js'
 
 export const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -47,6 +48,29 @@ const INVITE_TTL_MS = (() => {
 // legitimate frame is one 16 KB message plus its base64/JSON envelope; 256 KB is
 // generous headroom while still bounding a flood.
 const MAX_LINE_BYTES = 256 * 1024
+
+// --- SAS pairing, v2 (commit–reveal) ---
+// Wire version of the pairing exchange. v1 (0.4.0) derived the number from the keys
+// alone, which a man-in-the-middle can grind; v2 adds a commit–reveal round. The two
+// cannot interoperate, and a v1 peer is refused with a reason rather than left
+// showing a number the other side never will.
+const SAS_PROTOCOL = 2
+// A peer that has seen our committed value and walks away before revealing its own
+// is the one move an attacker gets: each such abandonment is a fresh one-in-a-million
+// try at making both humans see the same number. Count them, warn the humans early,
+// and close the rendezvous before the odds can add up to anything (20 in a million).
+// An honest peer reveals within milliseconds of receiving our commitment, so these
+// only accumulate from connection churn or someone probing.
+const PAIR_ABANDON_WARN = 5
+const PAIR_ABANDON_CLOSE = 20
+const PAIR_REVEAL_TIMEOUT_MS = 20_000
+// Concurrent exchanges per rendezvous: the id is public, so this bounds what anyone
+// who has it can make us hold open.
+const MAX_PAIR_PEERS = 16
+// Hyperswarm can briefly hold two connections to one peer. Each runs its own exchange
+// with its own number, so wait for the set to settle before telling a human which
+// number to read out.
+const PAIR_ANNOUNCE_DEBOUNCE_MS = 750
 
 // One place that decides what a bootstrap list looks like, used for the environment
 // variable and for the stored setting alike. A malformed value is refused rather than
@@ -476,12 +500,133 @@ export class Together extends EventEmitter {
     return null
   }
 
+  // One completed exchange per peer identity: the one whose transcript hashes lowest.
+  // Both sides hold the same transcript for the same connection, so they pick the same
+  // exchange — and therefore show the same number — even while Hyperswarm briefly
+  // keeps two connections to one peer.
+  _displayedPairPeers (session) {
+    const best = new Map()
+    for (const [conn, peer] of session.peers) {
+      if (!peer.sas) continue
+      const key = b4a.toString(peer.pk, 'hex')
+      const rank = b4a.toString(hash(peer.transcript), 'hex')
+      const cur = best.get(key)
+      if (!cur || rank < cur.rank) best.set(key, { conn, peer, rank })
+    }
+    return [...best.values()]
+  }
+
+  // Drop one connection's exchange. If we had already revealed our value and the peer
+  // never revealed theirs, that is the attacker's retry and it is counted.
+  _abandonPairExchange (session, conn, reason) {
+    const peer = session.peers.get(conn)
+    if (!peer) return
+    clearTimeout(peer.revealTimer)
+    session.peers.delete(conn)
+    const counted = peer.weRevealed && !peer.peerR
+    if (counted) {
+      session.abandoned = (session.abandoned || 0) + 1
+      if (reason) this._pairReject(reason, { id: session.id, abandoned: session.abandoned })
+      if (session.abandoned === PAIR_ABANDON_WARN || session.abandoned >= PAIR_ABANDON_CLOSE) {
+        const closing = session.abandoned >= PAIR_ABANDON_CLOSE
+        this.store.pushInbound({
+          id: b4a.toString(randomBytes(12), 'hex'),
+          roomName: session.roomName || `pairing ${session.id}`,
+          from: `claude-together pairing ${session.id}`,
+          text: `${session.abandoned} pairing attempts at rendezvous ${session.id} started and then walked away ` +
+            'after seeing this side\'s committed value. Connection trouble can do that occasionally; many in a ' +
+            'row is what someone trying to force a matching number looks like. ' +
+            (closing
+              ? 'The rendezvous has been closed. Open a new one and share its id only with the person you mean.'
+              : `It will close itself at ${PAIR_ABANDON_CLOSE}. Only confirm a number you have compared out of band.`),
+          ts: Date.now(),
+          priority: 'normal',
+          kind: 'presence'
+        })
+        if (closing) {
+          this._closePairing(session)
+          return
+        }
+      }
+    }
+    this._schedulePairAnnounce(session)
+  }
+
+  _schedulePairAnnounce (session) {
+    if (session.announceTimer) return
+    session.announceTimer = setTimeout(() => {
+      session.announceTimer = null
+      this._announcePairPeers(session)
+    }, PAIR_ANNOUNCE_DEBOUNCE_MS)
+    if (session.announceTimer.unref) session.announceTimer.unref()
+  }
+
+  // Tell the human which number to compare — once the connection set has settled,
+  // and again only if the number they should read actually changes.
+  _announcePairPeers (session) {
+    if (this.pendingPairs.get(session.hex) !== session) return
+    session.announced = session.announced || new Map()
+    const shown = this._displayedPairPeers(session)
+    const live = new Set()
+    for (const { peer } of shown) {
+      const key = b4a.toString(peer.pk, 'hex')
+      live.add(key)
+      if (session.announced.get(key) === peer.sas) continue
+      const replaced = session.announced.has(key)
+      session.announced.set(key, peer.sas)
+      this.emit('pair-peer', { id: session.id, name: peer.name, sas: peer.sas })
+      // Surface it in-session too: the rendezvous has no deadline, so the answer
+      // can arrive long after the tool call that opened it returned.
+      this.store.pushInbound({
+        id: b4a.toString(randomBytes(12), 'hex'),
+        roomName: session.roomName || `pairing ${session.id}`,
+        from: `claude-together pairing ${session.id}`,
+        text: (replaced
+          ? `The connection to ${peer.name} (key ${fingerprint(peer.pk)}) was replaced, so the number to ` +
+            `compare has changed. Compare this one instead: ${peer.sas}. `
+          : `${peer.name} (${peer.host || 'unknown host'}, key ${fingerprint(peer.pk)}) answered. ` +
+            `Compare this number with them out of band — say it out loud, do not paste it into the same ` +
+            `channel you shared the rendezvous id in: ${peer.sas}. `) +
+          'If they read back the same number, confirm the pairing with that number. If it differs, ' +
+          'someone else is answering — do not confirm, and tell your user.',
+        ts: Date.now(),
+        priority: 'normal',
+        kind: 'presence'
+      })
+    }
+    for (const key of [...session.announced.keys()]) {
+      if (!live.has(key)) session.announced.delete(key)
+    }
+    if (shown.length && session.resolve) session.resolve()
+  }
+
+  // A pre-commitment (0.4.0) peer cannot complete an exchange with us, but it will
+  // happily show its user a number. Tell ours why nothing appears on this side.
+  _noteOldPairPeer (session, pk, msg, theirProtocol) {
+    session.oldPeers = session.oldPeers || new Set()
+    const key = b4a.toString(pk, 'hex')
+    if (session.oldPeers.has(key)) return
+    session.oldPeers.add(key)
+    this.store.pushInbound({
+      id: b4a.toString(randomBytes(12), 'hex'),
+      roomName: session.roomName || `pairing ${session.id}`,
+      from: `claude-together pairing ${session.id}`,
+      text: `${String(msg.name || 'someone').slice(0, 64)} (key ${fingerprint(pk)}) answered rendezvous ` +
+        `${session.id} with an older pairing protocol (v${theirProtocol}) that this version refuses: its number ` +
+        'can be forged by a man-in-the-middle. They may be looking at a six-digit number anyway — it means ' +
+        'nothing. Ask them to update claude-together (0.4.1 or later) and answer again.',
+      ts: Date.now(),
+      priority: 'normal',
+      kind: 'presence'
+    })
+  }
+
   _pairingView (session) {
     return {
       id: session.id,
       role: session.role,
       roomName: session.roomName || null,
-      peers: [...session.peers.values()].map(p => ({
+      peers: this._displayedPairPeers(session).map(({ peer: p }) => ({
         name: p.name,
         host: p.host,
         label: p.label,
@@ -570,15 +715,18 @@ export class Together extends EventEmitter {
     const session = this._pairSessionFor(id)
     if (!session) throw new Error(`no pairing in progress with id ${id}`)
     const want = normalizeSas(sas)
-    const match = [...session.peers.entries()].find(([, p]) => normalizeSas(p.sas) === want)
+    // Only numbers a human could actually have been shown: completed exchanges, one per
+    // peer identity. A confirmation can never land on a half-done or superseded one.
+    const shown = this._displayedPairPeers(session)
+    const match = shown.find(({ peer: p }) => normalizeSas(p.sas) === want)
     if (!match) {
-      const seen = [...session.peers.values()].map(p => p.sas)
+      const seen = shown.map(({ peer: p }) => p.sas)
       throw new Error(seen.length
         ? `no peer at this rendezvous is showing ${sas}. Currently answering: ${seen.join(', ')}. ` +
           'A number that does not match on both sides means someone else answered — do not confirm it.'
         : `no peer has answered rendezvous ${session.id} yet.`)
     }
-    const [conn, peer] = match
+    const { conn, peer } = match
     peer.localConfirmed = true
     this._send(conn, {
       t: 'pair-confirm',
@@ -598,6 +746,8 @@ export class Together extends EventEmitter {
 
   _closePairing (session) {
     clearInterval(session.retry)
+    clearTimeout(session.announceTimer)
+    for (const peer of session.peers.values()) clearTimeout(peer.revealTimer)
     this.pendingPairs.delete(session.hex)
     this.store.removePairing(session.id)
     this._leaveTopic(session.topic)
@@ -623,6 +773,7 @@ export class Together extends EventEmitter {
       sid: this.sid,
       harness: harnessName(),
       v: VERSION,
+      sas: SAS_PROTOCOL,
       sig: b4a.toString(sign(helloSignable(session.id, pk, epk, session.nonce), this.keys.secretKey), 'hex')
     })
   }
@@ -730,6 +881,14 @@ export class Together extends EventEmitter {
         this.emit('peer-left', { roomId, name: state.peerName })
       }
       state.rooms.clear()
+      // A pairing exchange cannot outlive its connection: a confirmation sent down a
+      // dead one would be lost, and a stale entry beside a fresh one shows the human
+      // two numbers for one person.
+      for (const session of [...this.pendingPairs.values()]) {
+        if (session.peers.has(conn)) {
+          this._abandonPairExchange(session, conn, 'the connection closed before the exchange completed')
+        }
+      }
     }
     conn.on('close', cleanup)
     conn.on('error', cleanup)
@@ -897,22 +1056,39 @@ export class Together extends EventEmitter {
           this._pairReject('a session using this same identity key answered — pair between two different identities', { id: session.id })
           return
         }
+        if (msg.sas !== SAS_PROTOCOL) {
+          const theirs = Number.isInteger(msg.sas) ? msg.sas : 1
+          this._pairReject(`the peer speaks pairing protocol v${theirs}; this side needs v${SAS_PROTOCOL}, ` +
+            'which commits to its number before showing it. Both sides need claude-together 0.4.1 or later.', {
+            id: session.id
+          })
+          this._noteOldPairPeer(session, pk, msg, theirs)
+          return
+        }
+        if (session.peers.size >= MAX_PAIR_PEERS) {
+          this._pairReject('too many peers answering this rendezvous at once', { id: session.id })
+          return
+        }
         const secret = agree(session.eph.secretKey, epk)
         if (!secret) {
           this._pairReject('key agreement failed — the peer offered a degenerate agreement key', { id: session.id })
           return
         }
-        const transcript = pairingTranscript(
-          session.id,
-          { pk: this.keys.publicKey, epk: session.eph.publicKey },
-          { pk, epk }
-        )
+        // Our value for this exchange: fresh for every connection, committed to now,
+        // and revealed only once the peer's own commitment has arrived.
+        const r = randomBytes(32)
         const peer = {
           pk,
           epk,
           secret,
-          transcript,
-          sas: sasFrom(transcript),
+          r,
+          commit: sasCommitment(session.id, this.keys.publicKey, session.eph.publicKey, r),
+          peerCommit: null,
+          peerR: null,
+          weRevealed: false,
+          revealTimer: null,
+          transcript: null,
+          sas: null,
           name: String(msg.name || 'unknown').slice(0, 64),
           host: msg.host ? String(msg.host).slice(0, 64) : undefined,
           label: msg.label ? String(msg.label).slice(0, 64) : undefined,
@@ -921,25 +1097,59 @@ export class Together extends EventEmitter {
           peerConfirmed: false
         }
         session.peers.set(conn, peer)
-        clearTimeout(state.authTimer)
+        // Our hello first (the peer needs our keys to check what we later reveal),
+        // then our commitment. The stream keeps that order on the far side.
         this._sendPairHello(conn, session)
-        if (session.resolve) session.resolve()
-        this.emit('pair-peer', { id: session.id, name: peer.name, sas: peer.sas })
-        // Surface it in-session too: the rendezvous has no deadline, so the answer
-        // can arrive long after the tool call that opened it returned.
-        this.store.pushInbound({
-          id: b4a.toString(randomBytes(12), 'hex'),
-          roomName: session.roomName || `pairing ${session.id}`,
-          from: `claude-together pairing ${session.id}`,
-          text: `${peer.name} (${peer.host || 'unknown host'}, key ${fingerprint(peer.pk)}) answered. ` +
-            `Compare this number with them out of band — say it out loud, do not paste it into the same ` +
-            `channel you shared the rendezvous id in: ${peer.sas}. ` +
-            'If they read back the same number, confirm the pairing with that number. If it differs, ' +
-            'someone else is answering — do not confirm, and tell your user.',
-          ts: Date.now(),
-          priority: 'normal',
-          kind: 'presence'
-        })
+        this._send(conn, { t: 'pair-commit', id: session.id, c: b4a.toString(peer.commit, 'hex') })
+        break
+      }
+
+      case 'pair-commit': {
+        const session = this._pairSessionFor(msg.id)
+        if (!session) return
+        const peer = session.peers.get(conn)
+        if (!peer || peer.peerCommit) return
+        const c = hexBytes(msg.c, 32)
+        if (!c) {
+          this._pairReject('malformed commitment', { id: session.id })
+          this._abandonPairExchange(session, conn, null)
+          return
+        }
+        peer.peerCommit = c
+        // Their value is now fixed, so ours can no longer help them pick it. From
+        // here on, walking away without revealing counts against the rendezvous.
+        this._send(conn, { t: 'pair-reveal', id: session.id, r: b4a.toString(peer.r, 'hex') })
+        peer.weRevealed = true
+        peer.revealTimer = setTimeout(() => {
+          this._abandonPairExchange(session, conn, 'the peer saw our value and never revealed its own')
+        }, PAIR_REVEAL_TIMEOUT_MS)
+        if (peer.revealTimer.unref) peer.revealTimer.unref()
+        break
+      }
+
+      case 'pair-reveal': {
+        const session = this._pairSessionFor(msg.id)
+        if (!session) return
+        const peer = session.peers.get(conn)
+        if (!peer || !peer.weRevealed || peer.peerR) return
+        const r = hexBytes(msg.r, 32)
+        if (!r || !timingSafeEqual(sasCommitment(session.id, peer.pk, peer.epk, r), peer.peerCommit)) {
+          this._pairReject('the peer revealed a value that does not match its commitment', { id: session.id })
+          this._abandonPairExchange(session, conn, 'revealed a value that did not match its commitment')
+          return
+        }
+        clearTimeout(peer.revealTimer)
+        peer.peerR = r
+        peer.transcript = pairingTranscript(
+          session.id,
+          { pk: this.keys.publicKey, epk: session.eph.publicKey, r: peer.r },
+          { pk: peer.pk, epk: peer.epk, r }
+        )
+        peer.sas = sasFrom(peer.transcript)
+        // The exchange is complete, so the connection may now wait as long as the
+        // humans need to compare. Until this point the auth timer still applied.
+        clearTimeout(state.authTimer)
+        this._schedulePairAnnounce(session)
         break
       }
 
@@ -947,8 +1157,8 @@ export class Together extends EventEmitter {
         const session = this._pairSessionFor(msg.id)
         if (!session) return
         const peer = session.peers.get(conn)
-        if (!peer) {
-          this._pairReject('confirmation from a peer that never said hello', { id: session.id })
+        if (!peer || !peer.transcript) {
+          this._pairReject('confirmation from a peer that has not completed the exchange', { id: session.id })
           return
         }
         const sig = hexBytes(msg.sig, 64)
