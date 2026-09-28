@@ -7,7 +7,7 @@ import { Store } from './store.js'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { Together, VERSION, PKG_ROOT, parseBootstrap, parseRelay } from './transport.js'
 import { projectDir } from './scope.js'
 import { hooksStatus } from './hooks.js'
@@ -44,14 +44,33 @@ function readCluster () {
   }
 }
 
-function clusterAlive (state) {
-  if (!state?.pid) return false
+// A pid in the state file outlives the cluster if it crashes or the machine reboots,
+// and Windows reuses pids quickly. "Some process has that pid" is not enough to act
+// on: stop_local_bootstrap would kill whatever took the number. Require it to be a
+// node process too.
+function isNodeProcess (pid) {
   try {
-    process.kill(state.pid, 0)
-    return true
+    if (process.platform === 'win32') {
+      const row = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], {
+        encoding: 'utf8', windowsHide: true, timeout: 5000
+      })
+      return /^"node(\.exe)?"/i.test(row.trim())
+    }
+    const comm = execFileSync('ps', ['-p', String(pid), '-o', 'comm='], { encoding: 'utf8', timeout: 5000 })
+    return /(^|\/)node$/.test(comm.trim())
   } catch {
     return false
   }
+}
+
+function clusterAlive (state) {
+  if (!Number.isInteger(state?.pid)) return false
+  try {
+    process.kill(state.pid, 0)
+  } catch {
+    return false
+  }
+  return isNodeProcess(state.pid)
 }
 
 function describeBootstrap () {
@@ -215,10 +234,19 @@ server.registerTool('start_local_bootstrap', {
     return text(`A local cluster is already running on ${existing.host}:${existing.port} (pid ${existing.pid}). Stop it first to change it.`)
   }
   const bootPort = port || 49737
+  // Validate before starting anything: a value discovery would then refuse left a
+  // cluster running and its state file written, with discovery never switched.
+  try {
+    parseBootstrap([`${host}:${bootPort}`])
+  } catch (err) {
+    return text(`Not starting a cluster: ${err.message}`)
+  }
   const script = path.join(PKG_ROOT, 'scripts', 'bootstrap-node.js')
+  // windowsHide: detached gives the child its own console on Windows, and closing
+  // that window would kill the cluster.
   const child = spawn(process.execPath, [
     script, '--host', host, '--port', String(bootPort), '--nodes', String(nodes || 3)
-  ], { detached: true, stdio: 'ignore' })
+  ], { detached: true, stdio: 'ignore', windowsHide: true })
   child.unref()
   fs.mkdirSync(path.dirname(CLUSTER_STATE), { recursive: true })
   fs.writeFileSync(CLUSTER_STATE, JSON.stringify(
