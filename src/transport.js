@@ -180,6 +180,15 @@ export function peerText (value, max = 32, fallback = 'unknown') {
   return cleaned || fallback
 }
 
+function pidAlive (pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return err.code === 'EPERM' // exists, just not ours to signal
+  }
+}
+
 const peerVersion = v => (typeof v === 'string' && VERSION_RE.test(v) ? v : 'unknown')
 
 // Canonical byte string a message signature covers: every field a receiver acts
@@ -257,6 +266,11 @@ export class Together extends EventEmitter {
         this.store.removePairing(saved.id) // a malformed id could never be answered or cancelled
         continue
       }
+      // Another session in this project still owns it: leave it there. Two live copies
+      // of one rendezvous split the two confirmations between them and neither grants.
+      // (A reused pid can make a dead owner look alive; that only means this session
+      // does not take the rendezvous over, and cancel_pairing in the other still works.)
+      if (saved.owner && saved.owner.pid !== process.pid && pidAlive(saved.owner.pid)) continue
       const topic = rendezvousTopic(saved.id)
       const hex = b4a.toString(topic, 'hex')
       const session = {
@@ -273,6 +287,7 @@ export class Together extends EventEmitter {
         resolve: null
       }
       this.pendingPairs.set(hex, session)
+      this.store.savePairing(session) // now ours
       this._joinTopic(topic)
       if (session.role === 'joiner') this._startJoinLookups(session)
     }

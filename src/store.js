@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import b4a from 'b4a'
 import { scopedDir, identityFile } from './scope.js'
-import { signKeyPair } from './crypto.js'
+import { signKeyPair, normalizeCode } from './crypto.js'
 
 const LOG_REPLAY_MAX = 200
 const LOG_REPLAY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
@@ -50,7 +50,7 @@ export class Store {
     const explicit = dir || process.env.CLAUDE_TOGETHER_DIR
     this.dir = explicit || scopedDir()
     this.identityFile = explicit ? null : identityFile()
-    for (const d of ['', 'outbox', 'inbox', 'log', 'members']) {
+    for (const d of ['', 'outbox', 'inbox', 'log', 'members', 'pairings']) {
       fs.mkdirSync(path.join(this.dir, d), { recursive: true })
     }
     this._migrate()
@@ -240,39 +240,76 @@ export class Store {
   // rather than shown beside the new one). It is an ephemeral per-pairing secret in a
   // store that already holds the room keys and the signing key.
 
+  // One file per open pairing, like the inbox and outbox, and never config.json: that
+  // file holds the room keys, and read-modify-writes of it from two sessions in one
+  // project could drop a room key a grant had just added. Each file names the process
+  // that owns the rendezvous, so a second session in the same project does not revive
+  // it as well (two live copies of one rendezvous split the confirmations between them
+  // and neither ever grants).
+
+  _pairingFile (id) {
+    const key = normalizeCode(String(id || ''))
+    return /^[0-9A-Z]{12}$/.test(key) ? path.join('pairings', key + '.json') : null
+  }
+
   savePairing (p) {
-    const c = this._config()
-    c.pairings = c.pairings || {}
-    c.pairings[p.id] = {
+    const file = this._pairingFile(p.id)
+    if (!file) return
+    this._writeJson(file, {
+      id: p.id,
       role: p.role,
       roomId: p.roomId || null,
       roomName: p.roomName || null,
       ephPublicKey: b4a.toString(p.eph.publicKey, 'base64'),
       ephSecretKey: b4a.toString(p.eph.secretKey, 'base64'),
-      nonce: b4a.toString(p.nonce, 'base64')
-    }
-    this._writeJson('config.json', c)
+      nonce: b4a.toString(p.nonce, 'base64'),
+      owner: { pid: process.pid, at: Date.now() }
+    })
   }
 
   pairings () {
-    return Object.entries(this._config().pairings || {}).map(([id, p]) => ({
-      id,
-      role: p.role,
-      roomId: p.roomId || null,
-      roomName: p.roomName || null,
-      eph: {
-        publicKey: b4a.from(p.ephPublicKey, 'base64'),
-        secretKey: b4a.from(p.ephSecretKey, 'base64')
-      },
-      nonce: b4a.from(p.nonce, 'base64')
-    }))
+    this._migratePairings()
+    const out = []
+    let names = []
+    try { names = fs.readdirSync(this._file('pairings')) } catch {}
+    for (const name of names) {
+      if (!/^[0-9A-Z]{12}\.json$/.test(name)) continue
+      const p = this._readJson(path.join('pairings', name), null)
+      if (!p || typeof p.ephSecretKey !== 'string') continue
+      out.push({
+        id: p.id || name.slice(0, 12),
+        role: p.role,
+        roomId: p.roomId || null,
+        roomName: p.roomName || null,
+        eph: {
+          publicKey: b4a.from(p.ephPublicKey, 'base64'),
+          secretKey: b4a.from(p.ephSecretKey, 'base64')
+        },
+        nonce: b4a.from(p.nonce, 'base64'),
+        owner: p.owner && Number.isInteger(p.owner.pid) ? p.owner : null
+      })
+    }
+    return out
   }
 
   removePairing (id) {
+    const file = this._pairingFile(id)
+    if (file) {
+      try { fs.rmSync(this._file(file), { force: true }) } catch {}
+    }
+  }
+
+  // 0.4.0 kept open pairings inside config.json. Move them out once.
+  _migratePairings () {
     const c = this._config()
-    if (!c.pairings || !c.pairings[id]) return
-    delete c.pairings[id]
-    this._writeJson('config.json', c)
+    if (!c.pairings || !Object.keys(c.pairings).length) return
+    for (const [id, p] of Object.entries(c.pairings)) {
+      const file = this._pairingFile(id)
+      if (file && !fs.existsSync(this._file(file))) this._writeJson(file, { ...p, id }) // the key is the id
+    }
+    const fresh = this._config()
+    delete fresh.pairings
+    this._writeJson('config.json', fresh)
   }
 
   roomByName (name) {

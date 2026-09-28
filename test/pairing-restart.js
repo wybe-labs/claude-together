@@ -93,6 +93,44 @@ alice = new Together({ store: new Store(aliceDir), bootstrap })
 await alice.start()
 assert.deepEqual(alice.status().pendingPairings, [], 'cancelling must not come back')
 
+console.log('6. Open pairings live in their own files, never in config.json with the room keys…')
+const filed = alice.createPairing('restart-room-3')
+const config = JSON.parse(fs.readFileSync(path.join(aliceDir, 'config.json'), 'utf8'))
+assert.equal(config.pairings, undefined, 'config.json holds room keys and must not be rewritten per pairing')
+const pairingFiles = fs.readdirSync(path.join(aliceDir, 'pairings'))
+assert.equal(pairingFiles.length, 1)
+alice.cancelPairing(filed.id)
+
+console.log('7. A rendezvous still owned by another live session is not revived here…')
+const owned = alice.createPairing('restart-room-4')
+const ownedFile = path.join(aliceDir, 'pairings', fs.readdirSync(path.join(aliceDir, 'pairings'))[0])
+const saved = JSON.parse(fs.readFileSync(ownedFile, 'utf8'))
+saved.owner = { pid: process.ppid, at: Date.now() } // a live process that is not us
+fs.writeFileSync(ownedFile, JSON.stringify(saved))
+await alice.stop()
+alice = new Together({ store: new Store(aliceDir), bootstrap })
+await alice.start()
+assert.deepEqual(alice.status().pendingPairings, [], 'the other session keeps it; no second live copy')
+
+console.log('8. …but one whose owner has exited is picked up and claimed…')
+saved.owner = { pid: 2147483646, at: Date.now() } // no such process
+fs.writeFileSync(ownedFile, JSON.stringify(saved))
+await alice.stop()
+alice = new Together({ store: new Store(aliceDir), bootstrap })
+await alice.start()
+assert.deepEqual(alice.status().pendingPairings.map(p => p.id), [owned.id])
+assert.equal(JSON.parse(fs.readFileSync(ownedFile, 'utf8')).owner.pid, process.pid, 'now owned by this session')
+alice.cancelPairing(owned.id)
+
+console.log('9. Pairings a 0.4.0 store kept in config.json are moved out once…')
+const legacyId = 'ABCD-EFGH-JKMN'
+const cfg = JSON.parse(fs.readFileSync(path.join(aliceDir, 'config.json'), 'utf8'))
+cfg.pairings = { [legacyId]: { ...saved, owner: undefined } }
+fs.writeFileSync(path.join(aliceDir, 'config.json'), JSON.stringify(cfg))
+assert.deepEqual(alice.store.pairings().map(p => p.id), [legacyId])
+assert.equal(JSON.parse(fs.readFileSync(path.join(aliceDir, 'config.json'), 'utf8')).pairings, undefined)
+alice.store.removePairing(legacyId)
+
 await alice.stop()
 await bob.stop()
 await testnet.destroy()
