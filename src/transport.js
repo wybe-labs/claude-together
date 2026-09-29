@@ -1592,6 +1592,10 @@ export class Together extends EventEmitter {
       }
     })
     return {
+      // The version this server process is actually running. After an upgrade a
+      // session keeps the old code until its server restarts, so the version on disk
+      // says nothing about what a given session speaks.
+      version: VERSION,
       displayName: this.store.getName(),
       session: { host: os.hostname().slice(0, 64), label: sessionLabel(), sid: this.sid, harness: harnessName() },
       rooms,

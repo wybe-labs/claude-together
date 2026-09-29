@@ -23,7 +23,7 @@ Built on [Hyperswarm](https://github.com/holepunchto/hyperswarm): peers find eac
 through a public BitTorrent-style DHT, hole-punch a direct UDP connection, and talk over
 Noise-encrypted sockets. Exposed to Claude as an [MCP](https://modelcontextprotocol.io) server.
 
-**Current release: v0.4.1.** It adds SAS pairing (no invite secret), a relay fallback for
+**Current release: v0.4.2.** It adds SAS pairing (no invite secret), a relay fallback for
 networks that refuse to hole-punch, per-project registration, receiver-side interrupt
 opt-in, private-network bootstrap and a status line. Most of 0.4 is the work of
 [Kacper Wysocki](https://github.com/comotion) (see [Contributors](#contributors)).
