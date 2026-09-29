@@ -1,6 +1,6 @@
 {
   "name": "claude-together",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Serverless P2P session multiplayer for Claude Code — an MCP server over Hyperswarm",
   "type": "module",
   "main": "src/server.js",

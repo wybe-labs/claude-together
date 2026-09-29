@@ -30,17 +30,17 @@ function cmpVersion (a, b) {
 
 const AUTH_TIMEOUT_MS = 30_000
 const PAIR_TIMEOUT_MS = 90_000
-// Lifetime of a pre-0.4 invite code (the legacy secret-code path; v0.4 rendezvous ids
-// do not expire). Long enough for a real handoff (say the code on a call, paste it in
-// chat, wait for them to get to their keyboard) without minting a second code. Brute
-// force is not what this bounds: 60 bits behind argon2id-64MB, single-use, guessable
-// only online against a live announce, means even an hour is not attackable. What it
-// bounds is how long a code left in a chat thread stays a working credential.
-// Default 15 min; CLAUDE_TOGETHER_INVITE_TTL_MIN overrides it (minutes, clamped
-// 1..1440), read at startup.
+// Lifetime of a secret invite code — the default way in (public rendezvous ids do not
+// expire). Long enough for a real handoff across people and machines (say the code on
+// a call, paste it in a DM, wait for them to get to their keyboard) without minting a
+// second code. Brute force is not what this bounds: 60 bits behind argon2id-64MB,
+// single-use, guessable only online against a live announce, means even an hour is not
+// attackable. What it bounds is how long a code left in a chat thread stays a working
+// credential. Default 30 min; CLAUDE_TOGETHER_INVITE_TTL_MIN overrides it (minutes,
+// clamped 1..1440), read at startup.
 const INVITE_TTL_MS = (() => {
   const raw = Number(process.env.CLAUDE_TOGETHER_INVITE_TTL_MIN)
-  const minutes = Number.isFinite(raw) && raw > 0 ? Math.min(Math.max(raw, 1), 1440) : 15
+  const minutes = Number.isFinite(raw) && raw > 0 ? Math.min(Math.max(raw, 1), 1440) : 30
   return minutes * 60_000
 })()
 

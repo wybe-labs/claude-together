@@ -7,12 +7,9 @@ server, nothing to host, nothing to sign up for.
 
 ```
 you: "create an invite for room bug-hunt"
-      → rendezvous: X7KQ-2MPF-3HV9  (text it to your friend — it is not a secret)
+      → invite code: X7KQ-2MPF-3HV9  (send it to your friend privately)
 
 friend: "join room X7KQ-2MPF-3HV9"
-      → both of you see: 482 913   (say it out loud to each other)
-
-both: "confirm 482 913"
       → connected, directly, encrypted
 
 you: "tell bug-hunt: the leak is in token refresh, check session.ts"
@@ -23,15 +20,15 @@ Built on [Hyperswarm](https://github.com/holepunchto/hyperswarm): peers find eac
 through a public BitTorrent-style DHT, hole-punch a direct UDP connection, and talk over
 Noise-encrypted sockets. Exposed to Claude as an [MCP](https://modelcontextprotocol.io) server.
 
-**Current release: v0.4.2.** It adds SAS pairing (no invite secret), a relay fallback for
-networks that refuse to hole-punch, per-project registration, receiver-side interrupt
-opt-in, private-network bootstrap and a status line. Most of 0.4 is the work of
-[Kacper Wysocki](https://github.com/comotion) (see [Contributors](#contributors)).
-0.4.1 hardens it: pairing numbers now come from a commit–reveal exchange, so a
-man-in-the-middle can't force them to match.
-**Wire compatibility:** both sides need **0.4.1** to pair. A 0.4.0 peer is refused with a
-reason, because its pairing can be forged. To reach a 0.3.x peer, use
-`create_legacy_invite`. Rooms you are already in keep working across all of these.
+**Current release: v0.5.0.** Joining is one step again: share a short secret invite code
+privately, your friend says "join room <code>", done. There's nothing to confirm, and it
+works with peers on any version from 0.3 on. 0.4 added a relay fallback for networks that
+refuse to hole-punch, per-project registration, receiver-side interrupt opt-in,
+private-network bootstrap, a status line, and optional public invites. Most of that is
+the work of [Kacper Wysocki](https://github.com/comotion) (see
+[Contributors](#contributors)). Public invites carry a six-digit number to compare, for
+when an invite has to be shared somewhere others can see it. Those need 0.4.1 or later
+on both sides. Rooms you are already in keep working across all of these.
 
 ### ▶ 30-second explainer
 
@@ -72,9 +69,8 @@ natural language — both end up calling the same MCP tools.
 
 | Slash command | Shorthand for |
 |---|---|
-| `/together-invite bug-hunt` | create a room + open a pairing rendezvous |
-| `/together-join X7KQ-2MPF-3HV9` | answer a friend's rendezvous, get the number to compare |
-| `/together-confirm 482 913` | confirm the number you both read aloud — completes the pairing |
+| `/together-invite bug-hunt` | create a room + a secret invite code to send your friend |
+| `/together-join X7KQ-2MPF-3HV9` | join a friend's room with their code |
 | `/together-send bug-hunt found it, check session.ts` | send a message (lands when their turn ends) |
 | `/together-send bug-hunt to alice: here's that stack trace` | address specific people — only they get active delivery |
 | `/together-interrupt bug-hunt stop, merging a fix now` | barge into their running session (if that room opted in) |
@@ -86,8 +82,8 @@ Or just talk to Claude in any session:
 
 | You say | What happens |
 |---|---|
-| "create an invite for room `name`" | Creates the room and opens a pairing rendezvous, printing a short id. The id is not a secret and does not expire. Keep your session open until the pairing completes. |
-| "join room `X7KQ-2MPF-3HV9`" | Answers a friend's rendezvous and returns a six-digit number to compare out of band; after you both confirm it, you are in. Everyone already in the room automatically gets a "`name` joined the room (`hostname` · `session label` · `harness`)" notice — even members who are offline see it when they reconnect. The label defaults to your project folder name; set `CLAUDE_TOGETHER_LABEL` to override it. |
+| "create an invite for room `name`" | Creates the room and prints a short single-use invite code, valid for 30 minutes by default (`CLAUDE_TOGETHER_INVITE_TTL_MIN` changes that). Send it to your friend privately, since whoever redeems it first gets in. Keep your session open until they join. |
+| "join room `X7KQ-2MPF-3HV9`" | Joins your friend's room with their code. There's nothing to confirm: holding the code is the proof. Everyone already in the room automatically gets a "`name` joined the room (`hostname` · `session label` · `harness`)" notice — even members who are offline see it when they reconnect. The label defaults to your project folder name; set `CLAUDE_TOGETHER_LABEL` to override it. |
 | "send to `name`: …" | Delivers instantly if they're online, otherwise queues on disk and delivers when you're both online. |
 | "check my messages" | Fetches everything unread, across all rooms. |
 | "multiplayer status" | Rooms, connected peers, known members with last-seen times, queued/unread counts. |
@@ -223,7 +219,22 @@ listing them — mint fresh invites in the projects that need them, or set
 `CLAUDE_TOGETHER_DIR=~/.claude-together` to keep using the old shared store. Your
 display name (and new signing identity) carry over automatically.
 
-## Why there is no invite secret
+## Invites
+
+**The normal way: a secret code.** `create_invite` makes a short single-use code. Both
+sides stretch it with argon2id, meet at a DHT topic derived from it, and prove to each
+other that they know it. Then the inviter hands over the room's random 256-bit key over
+that authenticated, encrypted link. The code is retired as soon as it's used, or after
+its lifetime. Knowing the code is the whole proof, so the only rule is to send it
+privately. Someone who got hold of it before your friend redeemed it would get in
+instead. If that might have happened, make a new code.
+
+**Optional: public invites.** If an invite has to be posted where others can see it,
+such as a team channel, `create_public_invite` makes an id that is not a secret. Proof
+then comes from a number both people compare, as described below. You never need this
+for sending a code to a friend.
+
+### How public invites work
 
 Pairing does not rely on the id staying private, so there is nothing to leak, nothing
 to expire, and no window to miss. The id names a meeting point; **two humans reading
