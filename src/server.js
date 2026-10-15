@@ -163,7 +163,11 @@ server.registerTool('create_invite', {
     `Invite code for room "${inv.roomName}": ${inv.code}\n` +
     `Single use, valid for ${inv.expiresInMinutes} minutes. Send it to your friend privately and ` +
     `tell them to say: "join room ${inv.code}". Anyone holding the code can join, so don't post it ` +
-    'publicly. Keep this session open until they have joined.'
+    'publicly. ' +
+    (inv.alsoRedeemableVia
+      ? `The room's anchor also holds the code, so they can join through it even if they cannot reach this ` +
+        'machine directly; keeping this session open is not required.'
+      : 'Keep this session open until they have joined.')
   )
 })
 
@@ -402,7 +406,7 @@ server.registerTool('show_history', {
 
 server.registerTool('status', {
   title: 'Multiplayer status',
-  description: 'Show your display name, rooms joined by this project, currently connected peers, known room members with last-seen times, queued undelivered messages, unread count, which bootstrap discovery uses, and whether delivery hooks are installed for this project. If they are not, say so when reporting status: incoming messages will not appear on their own until check_messages is called.',
+  description: 'Show your display name, rooms joined by this project, currently connected peers, known room members with last-seen times, queued undelivered messages, unread count, which bootstrap discovery uses, whether delivery hooks are installed for this project, what kind of network this machine is on (network.nat), and, per room, peers that were found but could not be connected to (unreachablePeers, each with a plain-language reason). When a room has unreachable peers, relay their \"why\" to the user: it says what to do about it. If delivery hooks are not installed, say so when reporting status: incoming messages will not appear on their own until check_messages is called.',
   inputSchema: {}
 }, async () => {
   const scope = process.env.CLAUDE_TOGETHER_DIR

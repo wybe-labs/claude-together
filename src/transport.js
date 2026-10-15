@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Hyperswarm from 'hyperswarm'
+import DHT from 'hyperdht'
 import hypercoreCrypto from 'hypercore-crypto'
 import b4a from 'b4a'
 import { projectStores } from './scope.js'
@@ -101,6 +102,44 @@ export function parseRelay (value) {
       'It names the node that will carry the connection, not an address.')
   }
   return b4a.from(hex, 'hex')
+}
+
+// Why a peer could not be reached, in words a person can act on. Keyed by the error
+// codes hyperdht gives a failed connection; anything else falls back to its message.
+const CONNECT_ADVICE = {
+  HOLEPUNCH_DOUBLE_RANDOMIZED_NATS: 'both networks change ports on every connection, so no direct path exists between them. An anchor (scripts/anchor.js) on a well-connected machine, or a relay, gets them talking',
+  HOLEPUNCH_ABORTED: 'the hole punch was given up, usually because one network blocks unsolicited UDP. An anchor on a well-connected machine gets around it',
+  HOLEPUNCH_PROBE_TIMEOUT: 'the hole punch never got a reply, which is what a firewall dropping UDP looks like. An anchor on a well-connected machine gets around it',
+  CANNOT_HOLEPUNCH: 'the networks cannot be punched through to each other. An anchor on a well-connected machine gets around it',
+  REMOTE_NOT_HOLEPUNCHABLE: 'their network refuses hole punching. An anchor on a well-connected machine gets around it',
+  REMOTE_NOT_HOLEPUNCHING: 'their side stopped answering mid-punch, often a session closing or a laptop going to sleep',
+  PEER_NOT_FOUND: 'their announcement on the DHT has gone stale; they are probably offline',
+  PEER_CONNECTION_FAILED: 'no path to them was found. If you are on the same building or company network, its NAT may not loop back (hairpin): run a local bootstrap or an anchor inside that network',
+  ETIMEDOUT: 'the connection timed out, which on two different Wi-Fi networks in one building usually means the NAT does not loop back (hairpin). A local bootstrap or an anchor inside that network fixes it',
+  RELAY_ABORTED: 'the relay did not carry the connection'
+}
+
+function adviceFor (err) {
+  return CONNECT_ADVICE[err?.code] || String(err?.message || err || 'unknown error').slice(0, 200)
+}
+
+// The DHT the swarm runs on, unchanged except that it remembers how the last attempt
+// to reach each peer ended. Hyperswarm keeps that to itself and simply retries, so
+// from the outside a peer that can never be reached looks exactly like a peer who
+// never came online. This is what lets status tell the two apart.
+class ObservedDHT extends DHT {
+  constructor (opts, onResult) {
+    super(opts)
+    this._onResult = onResult
+  }
+
+  connect (remotePublicKey, opts) {
+    const socket = super.connect(remotePublicKey, opts)
+    const key = b4a.toString(remotePublicKey, 'hex')
+    socket.once('open', () => this._onResult(key, null))
+    socket.once('error', err => this._onResult(key, err))
+    return socket
+  }
 }
 
 function roomIdFor (roomKey) {
@@ -210,11 +249,22 @@ function signable (m) {
 // each side proves knowledge of its keys with nonce-bound MACs, and re-proves whenever
 // it learns a new key (e.g. right after a pairing grant hands over the room key).
 export class Together extends EventEmitter {
-  constructor ({ store, bootstrap = undefined, relay = undefined } = {}) {
+  // firewall and dhtOptions are for tests and embedders: firewall(remotePublicKey)
+  // returning true refuses that peer in both directions, and dhtOptions reach the DHT.
+  // anchor marks a headless always-on member (src/anchor.js): it says so in its hello,
+  // and it accepts invites a member hands it, so people who cannot reach the inviter
+  // can still redeem their code through it.
+  constructor ({ store, bootstrap = undefined, relay = undefined, firewall = undefined, dhtOptions = undefined, anchor = false } = {}) {
     super()
+    this.isAnchor = anchor === true
     this.store = store
     this.bootstrap = bootstrap
     this.relay = relay
+    this.firewall = firewall
+    this.dhtOptions = dhtOptions
+    // Swarm public key (hex) -> how the most recent outbound attempt to it failed.
+    // Cleared when a connection to it opens.
+    this.connectFailures = new Map()
     // Short per-process session id: distinguishes two sessions running in the
     // same project on the same machine (name, host, and label all match there).
     this.sid = b4a.toString(randomBytes(3), 'hex')
@@ -248,9 +298,27 @@ export class Together extends EventEmitter {
     // from room keys, not from this connection identity.
     // relayThrough is consulted only after a direct connection fails, or when this
     // node's NAT randomizes ports, so naming a relay costs nothing while punching works.
+    const dht = new ObservedDHT({ bootstrap: this.bootstrap, ...this.dhtOptions }, (key, err) => {
+      if (!err) {
+        this.connectFailures.delete(key)
+        return
+      }
+      // A duplicate is hyperswarm dropping a second socket to someone it already
+      // reaches, not a failure to reach them.
+      if (err.code === 'DUPLICATE_CONNECTION') return
+      const prev = this.connectFailures.get(key)
+      this.connectFailures.set(key, {
+        code: err.code || null,
+        advice: adviceFor(err),
+        at: Date.now(),
+        attempts: (prev?.attempts || 0) + 1
+      })
+      if (this.connectFailures.size > 500) this.connectFailures.delete(this.connectFailures.keys().next().value)
+    })
     this.swarm = new Hyperswarm({
       keyPair: hypercoreCrypto.keyPair(),
-      bootstrap: this.bootstrap,
+      dht,
+      ...(this.firewall ? { firewall: this.firewall } : {}),
       ...(this.relay ? { relayThrough: this.relay } : {})
     })
     this.swarm.on('connection', conn => this._onConnection(conn))
@@ -449,7 +517,47 @@ export class Together extends EventEmitter {
     this.pendingInvites.set(hex, { roomId: room.id, codeKey, timer, topic, expiresAt: Date.now() + INVITE_TTL_MS })
     this._joinTopic(topic)
     this._reproveAll()
-    return { code, roomName: room.name, expiresInMinutes: INVITE_TTL_MS / 60000 }
+    const anchors = this._delegateInvite(hex)
+    return {
+      code,
+      roomName: room.name,
+      expiresInMinutes: INVITE_TTL_MS / 60000,
+      ...(anchors ? { alsoRedeemableVia: anchors } : {})
+    }
+  }
+
+  // Hand a pending invite to the room's connected anchors, so a joiner who cannot
+  // reach this machine can redeem the code through one of them. An anchor already
+  // holds the room key, so this grants it nothing new; what it gets is the code's
+  // derived key, which lets it answer on the code's topic and prove it knows the code.
+  // Whoever grants first tells the others the code is spent. Returns how many anchors
+  // now hold it.
+  _delegateInvite (hex, onlyConn = null) {
+    const inv = this.pendingInvites.get(hex)
+    if (!inv || inv.granted || inv.delegated) return 0
+    let count = 0
+    for (const conn of onlyConn ? [onlyConn] : this.roomConns.get(inv.roomId) || []) {
+      if (!conn._ct?.peerAnchor || !conn._ct.rooms.has(inv.roomId)) continue
+      this._send(conn, {
+        t: 'invite-delegate',
+        roomId: inv.roomId,
+        id: hex,
+        codeKey: b4a.toString(inv.codeKey, 'base64'),
+        expiresAt: inv.expiresAt
+      })
+      count++
+    }
+    return count
+  }
+
+  // A code is single-use however many members can redeem it. The member that grants
+  // it tells the rest of the room straight away, at grant time rather than at the
+  // joiner's ack, to keep the window in which a second holder of the code could be
+  // let in by someone else as short as the network allows.
+  _announceInviteSpent (hex, roomId, except) {
+    for (const conn of this.roomConns.get(roomId) || []) {
+      if (conn !== except) this._send(conn, { t: 'invite-spent', roomId, id: hex })
+    }
   }
 
   _expireInvite (hex) {
@@ -898,6 +1006,7 @@ export class Together extends EventEmitter {
 
   _onConnection (conn) {
     this.conns.add(conn)
+    if (conn.remotePublicKey) this.connectFailures.delete(b4a.toString(conn.remotePublicKey, 'hex'))
     const state = {
       nonce: randomBytes(24),
       peerNonce: null,
@@ -990,7 +1099,10 @@ export class Together extends EventEmitter {
       kind: c.kind,
       mac: b4a.toString(mac(derive(c.key, 'auth'), state.peerNonce, state.nonce), 'base64')
     }))
-    this._send(conn, { t: 'auth2', proofs })
+    // The anchor flag rides on the proofs, ahead of the hello, because it decides
+    // whether a pairing proof in this same batch is a joiner or a fellow holder of the
+    // code. Claiming it falsely only ever withholds a grant from the claimant.
+    this._send(conn, { t: 'auth2', proofs, ...(this.isAnchor ? { anchor: true } : {}) })
   }
 
   // Called when our candidate set changes (new room key learned, invite/join started)
@@ -1013,6 +1125,7 @@ export class Together extends EventEmitter {
 
       case 'auth2': {
         if (!state.peerNonce) return
+        if (msg.anchor === true) state.peerAnchor = true
         let matchedNew = false
         for (const proof of msg.proofs || []) {
           const cand = this._candidates().find(c => c.id === proof.id && c.kind === proof.kind)
@@ -1036,7 +1149,8 @@ export class Together extends EventEmitter {
               label: sessionLabel(),
               sid: this.sid,
               harness: harnessName(),
-              v: VERSION
+              v: VERSION,
+              ...(this.isAnchor ? { anchor: true } : {})
             })
             // At-least-once delivery: replay everything not yet acked for this room,
             // then gossip recent room history. The peer dedups by message id, so this
@@ -1057,10 +1171,15 @@ export class Together extends EventEmitter {
             // the invite is spent at grant-send, not at ack — so a second redeemer
             // racing the ack window gets nothing. If the winner's connection dies
             // mid-pairing the code is burned; codes are cheap, mint a new one.
-            if (inv && !inv.granted) {
+            // Fellow holders of the code prove it too: an anchor it was handed to, and,
+            // seen from that anchor, the member who handed it over. Both are already in
+            // the room. Granting to one would spend the code on someone already inside.
+            const fellowHolder = state.rooms.has(inv?.roomId) && (state.peerAnchor || inv?.delegated)
+            if (inv && !inv.granted && !fellowHolder) {
               const room = this.store.rooms().find(r => r.id === inv.roomId)
               if (room) {
                 inv.granted = true
+                this._announceInviteSpent(cand.id, inv.roomId, conn)
                 const grant = JSON.stringify({
                   roomKey: b4a.toString(room.key, 'base64'),
                   roomName: room.name
@@ -1090,11 +1209,56 @@ export class Together extends EventEmitter {
         state.peerSid = typeof msg.sid === 'string' && SID_RE.test(msg.sid) ? msg.sid : null
         state.peerHarness = typeof msg.harness === 'string' && HARNESS_RE.test(msg.harness) ? msg.harness : null
         state.peerVersion = typeof msg.v === 'string' && /^\d+\.\d+\.\d+$/.test(msg.v) ? msg.v : null
+        state.peerAnchor = state.peerAnchor || msg.anchor === true
         this.store.touchMember(roomId, state.peerName, Date.now(), {
-          host: state.peerHost, label: state.peerLabel, harness: state.peerHarness
+          host: state.peerHost, label: state.peerLabel, harness: state.peerHarness, anchor: state.peerAnchor
         })
         this._versionCheck(state, roomId)
         this.emit('peer-joined', { roomId, name: state.peerName })
+        // An anchor that arrives after an invite was made can still take it.
+        if (state.peerAnchor) {
+          for (const [hex, inv] of this.pendingInvites) {
+            if (inv.roomId === roomId) this._delegateInvite(hex, conn)
+          }
+        }
+        break
+      }
+
+      case 'invite-delegate': {
+        // Only an anchor takes these, only from a member proven for the room, and only
+        // for a room it is in itself: it can be handed nothing it could not already do.
+        if (!this.isAnchor) return
+        const roomId = String(msg.roomId || '')
+        if (!state.rooms.has(roomId)) return
+        if (!this.store.rooms().some(r => r.id === roomId)) return
+        const hex = String(msg.id || '')
+        if (!/^[0-9a-f]{64}$/.test(hex) || this.pendingInvites.has(hex)) return
+        const codeKey = b4a.from(String(msg.codeKey || ''), 'base64')
+        if (codeKey.length !== 32) return
+        const topic = topicFor(codeKey, 'pairing')
+        // The id names the topic, so a delegation whose key does not derive it is junk.
+        if (b4a.toString(topic, 'hex') !== hex) return
+        // Never outlive the longest lifetime an invite can be given.
+        const left = Math.min(Number(msg.expiresAt) - Date.now(), 1440 * 60_000)
+        if (!(left > 0)) return
+        const timer = setTimeout(() => this._expireInvite(hex), left)
+        if (timer.unref) timer.unref()
+        this.pendingInvites.set(hex, { roomId, codeKey, timer, topic, expiresAt: Date.now() + left, delegated: true })
+        this._joinTopic(topic)
+        this._reproveAll()
+        break
+      }
+
+      case 'invite-spent': {
+        const roomId = String(msg.roomId || '')
+        if (!state.rooms.has(roomId)) return
+        const hex = String(msg.id || '')
+        const inv = this.pendingInvites.get(hex)
+        if (!inv || inv.roomId !== roomId || inv.granted) return
+        this._expireInvite(hex)
+        // An anchor passes it on: the member that made the invite may be connected
+        // only to the anchor, not to whoever granted it.
+        if (this.isAnchor) this._announceInviteSpent(hex, roomId, conn)
         break
       }
 
@@ -1556,8 +1720,68 @@ export class Together extends EventEmitter {
 
   // --- introspection ---
 
+  // How this machine's network looks to the DHT, and why it might not reach someone.
+  // Peers are found by topic long before anyone knows who they are, so a peer that
+  // announces on a room's topic and can never be connected to is counted against that
+  // room even though its name is not known yet.
+  network () {
+    const dht = this.swarm?.dht
+    // Bootstrapping finished and no DHT node ever answered: nothing gets in or out.
+    // Hyperswarm speaks UDP only, so this is what a network that blocks outbound UDP
+    // looks like (some cloud sandboxes and locked-down corporate networks). No relay
+    // or anchor helps here: reaching either needs the same UDP.
+    if (dht?.bootstrapped && dht.toArray().length === 0) {
+      return {
+        nat: 'offline',
+        explanation: 'no DHT node answered. This network appears to block outbound UDP, which claude-together needs to reach anyone: neither a relay nor an anchor can help until UDP is allowed (or a bootstrap inside this network is configured)'
+      }
+    }
+    if (!dht || dht.host === null) {
+      return { nat: 'not determined yet', explanation: 'the DHT has not finished probing this network; ask again in a few seconds' }
+    }
+    if (!dht.firewalled) {
+      return {
+        nat: 'open',
+        explanation: 'this machine is reachable from the internet directly, so anyone can connect to it. It would make a good anchor (scripts/anchor.js) for rooms whose members cannot reach each other'
+      }
+    }
+    if (dht.randomized) {
+      return {
+        nat: 'random ports',
+        explanation: 'this network gives every connection a different port (a symmetric NAT, common on mobile hotspots, guest and corporate Wi-Fi). Direct connections still work to peers on ordinary networks, but not to peers whose network does the same. An anchor on a well-connected machine, or a relay, covers that'
+      }
+    }
+    return {
+      nat: 'consistent ports',
+      explanation: 'this network keeps one port per connection, so hole punching works with nearly everyone'
+    }
+  }
+
+  _unreachableFor (room) {
+    if (!this.swarm) return []
+    const topicHex = b4a.toString(topicFor(room.key, 'room'), 'hex')
+    const connected = new Set([...this.conns].filter(c => c.remotePublicKey).map(c => b4a.toString(c.remotePublicKey, 'hex')))
+    const out = []
+    for (const peer of this.swarm.peers.values()) {
+      const key = b4a.toString(peer.publicKey, 'hex')
+      if (connected.has(key)) continue
+      const failure = this.connectFailures.get(key)
+      if (!failure) continue
+      if (!peer.topics.some(t => b4a.toString(t, 'hex') === topicHex)) continue
+      out.push({
+        peer: key.slice(0, 12),
+        failedAttempts: failure.attempts,
+        lastTried: new Date(failure.at).toISOString(),
+        ...(failure.code ? { error: failure.code } : {}),
+        why: failure.advice
+      })
+    }
+    return out
+  }
+
   status () {
     const rooms = this.store.rooms().map(r => {
+      const unreachable = this._unreachableFor(r)
       const conns = [...(this.roomConns.get(r.id) || [])]
       const connectedPeers = conns.map(c => {
         const s = c._ct
@@ -1567,7 +1791,8 @@ export class Together extends EventEmitter {
           ...(s.peerHost ? { host: s.peerHost } : {}),
           ...(s.peerLabel ? { label: s.peerLabel } : {}),
           ...(s.peerSid ? { sid: s.peerSid } : {}),
-          ...(s.peerHarness ? { harness: s.peerHarness } : {})
+          ...(s.peerHarness ? { harness: s.peerHarness } : {}),
+          ...(s.peerAnchor ? { anchor: true } : {})
         }
       })
       const onlineNames = new Set(connectedPeers.map(p => p.name))
@@ -1579,6 +1804,7 @@ export class Together extends EventEmitter {
           ...(m.host ? { host: m.host } : {}),
           ...(m.label ? { label: m.label } : {}),
           ...(m.harness ? { harness: m.harness } : {}),
+          ...(m.anchor ? { anchor: true } : {}),
           ...(m.pk ? { keyFingerprint: m.pk.slice(0, 12) } : {})
         }))
         .sort((a, b) => (b.online - a.online) || (b.lastSeen < a.lastSeen ? -1 : 1))
@@ -1588,6 +1814,7 @@ export class Together extends EventEmitter {
         interrupts: r.allowInterrupt ? 'allowed mid-turn' : 'off — messages land at turn end',
         connectedPeers,
         members,
+        ...(unreachable.length ? { unreachablePeers: unreachable } : {}),
         pendingOutbound: this.store.outboundFor(r.id).length
       }
     })
@@ -1598,6 +1825,7 @@ export class Together extends EventEmitter {
       version: VERSION,
       displayName: this.store.getName(),
       session: { host: os.hostname().slice(0, 64), label: sessionLabel(), sid: this.sid, harness: harnessName() },
+      network: this.network(),
       rooms,
       pendingInvites: this.pendingInvites.size,
       pendingPairings: [...this.pendingPairs.values()].map(s => this._pairingView(s)),

@@ -403,12 +403,13 @@ export class Store {
     const members = this.membersFor(roomId)
     const prev = members[name]
     const pinsKey = info?.pk && !prev?.pk && /^[0-9a-f]{64}$/.test(info.pk)
-    const hasNewInfo = (info && (info.host || info.label || info.harness)) || pinsKey
+    const hasNewInfo = (info && (info.host || info.label || info.harness || (info.anchor && !prev?.anchor))) || pinsKey
     if (prev && prev.lastSeen >= ts && !hasNewInfo) return
     const next = { ...(prev || {}), lastSeen: Math.max(ts, prev?.lastSeen || 0) }
     if (info?.host) next.host = String(info.host).slice(0, 64)
     if (info?.label) next.label = String(info.label).slice(0, 64)
     if (info?.harness) next.harness = String(info.harness).slice(0, 32)
+    if (info?.anchor) next.anchor = true
     // TOFU pin: a member's first verified public key sticks; it is never
     // overwritten here — a different key later is flagged upstream, not adopted.
     if (pinsKey) next.pk = info.pk

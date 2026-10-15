@@ -326,7 +326,8 @@ trusted.
   name is taken on faith, display names are not unique, and `host`/`label`/`sid` remain
   self-asserted decoration. Treat the warnings as real, and the absence of warnings as
   strong-but-not-absolute.
-- **Any member can invite anyone.** There is no admin role or approval step.
+- **Any member can invite anyone.** There is no admin role or approval step. An
+  invite made while an anchor is connected is redeemable through the anchor as well.
 - **Prompt-injection risk is real.** Messages are injected into your live Claude session
   (mid-turn for `interrupt` priority, when the agent has tool access). The untrusted-data
   framing reduces but does not eliminate the risk that a crafted message manipulates the
@@ -353,8 +354,58 @@ to your inbox, and start a new room if it might have leaked.
   whoever reconnects. A message is only stuck if literally no one who has it is
   online at the same time as you.
 - **No central relay by design**: if two peers are both behind carrier-grade NAT,
-  hole punching can fail (~5% of pairings). Easiest fix: both install
-  [Tailscale](https://tailscale.com) — the swarm then finds the direct tailnet path.
+  hole punching can fail (~5% of pairings). `status` says when that is happening and
+  why (below). The fixes, simplest first: an [anchor](#anchors-for-members-who-cannot-reach-each-other)
+  on any well-connected machine, or both installing [Tailscale](https://tailscale.com)
+  so the swarm finds the direct tailnet path.
+
+### Seeing why someone is not connecting
+
+A peer you can never reach used to look exactly like a peer who never came online.
+`status` now tells them apart:
+
+- `network.nat` says what this machine's network does: `consistent ports` (hole
+  punching works with nearly everyone), `random ports` (a symmetric NAT, common on
+  hotspots, guest and corporate Wi-Fi: direct connections fail to peers whose network
+  does the same), `open` (reachable directly, which makes this machine a good anchor),
+  or `offline` (no DHT node answered at all: the network blocks outbound UDP, which
+  claude-together needs, so no relay or anchor can help until UDP is allowed. Some cloud
+  sandboxes are like this).
+- Each room lists `unreachablePeers`: peers announcing on the room's topic that every
+  connection attempt to has failed, with the error and a plain-language reason. Two
+  Wi-Fi networks in one building whose NAT does not loop back (hairpin) show up here as
+  timeouts; two networks that both randomize ports show up as exactly that.
+
+### Anchors: for members who cannot reach each other
+
+Members already forward live messages to everyone else they are connected to, and
+replay their recent log to whoever reconnects. So two people who cannot connect to each
+other still talk, as long as someone both of them can reach is online. An **anchor** is
+a member that is always there to be that someone: a headless session with nobody behind
+it, run on any machine with a decent network that stays up (a home server, an always-on
+desktop, a small VPS).
+
+```
+npm run anchor -- --join X7KQ-2MPF-3HV9     # a code from any member's create_invite
+npm run anchor                              # later runs: rejoins every room it holds
+```
+
+- **Adding one is a member's decision.** It joins by redeeming an ordinary invite, and
+  the room sees it join under its own name (`anchor-<hostname>`, or `--name`). `status`
+  marks it as an anchor.
+- **Joining works through it too.** Redeeming an invite normally needs a direct
+  connection to whoever made it, which is the very thing that fails here. When a member
+  creates an invite while an anchor is connected, the anchor is handed the code as well,
+  so the joiner can redeem it through the anchor, and the inviter does not even need to
+  stay online. The code is still single-use: whoever grants it tells the rest of the
+  room at once.
+- **It is a member, with a member's access.** It holds the room key and can read the
+  room, like anyone in it. Run it on a machine you would trust with that. It keeps its
+  own identity and store (`~/.claude-together/anchor`, or `--dir`), drops its inbox, and
+  keeps only the room log it replays.
+- `CLAUDE_TOGETHER_BOOTSTRAP` and `CLAUDE_TOGETHER_RELAY` apply to it as to any session
+  and must match the sessions it serves. On start it reports its own network type, and
+  warns if it is on a network that randomizes ports, where it would be a poor anchor.
 
 ### Corporate networks: use your own bootstrap node
 
