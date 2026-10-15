@@ -433,12 +433,32 @@ server.registerTool('show_history', {
   description: 'Read the recent chat log of a room (up to the last 200 messages / 7 days), including messages relayed while you were offline. Non-destructive: unlike check_messages this clears nothing — use it to answer "what did they say earlier?".',
   inputSchema: {
     room_name: z.string().describe('Room whose history to show'),
-    count: z.number().int().min(1).max(200).optional().describe('How many recent messages (default 30)')
+    count: z.number().int().min(1).max(200).optional().describe('How many recent messages (default 30)'),
+    format: z.enum(['text', 'json']).optional().describe('"json" returns the messages as data, for programs such as the Claude Together panel; leave it out when reading history to a person')
   }
-}, async ({ room_name, count }) => {
+}, async ({ room_name, count, format }) => {
   const room = store.roomByName(room_name)
+  const msgs = room ? store.logTail(room.id).slice(-(count || 30)) : []
+  // For programs: the same messages as fields, with no prose to parse. The text in them
+  // is still other people's words, which the reader must treat as data.
+  if (format === 'json') {
+    if (!room) return { content: [{ type: 'text', text: JSON.stringify({ error: `no room named "${room_name}"` }) }], isError: true }
+    return text(JSON.stringify({
+      room: room.name,
+      messages: msgs.map(m => ({
+        id: m.id,
+        from: m.from,
+        text: m.text,
+        ts: m.ts,
+        kind: m.kind,
+        ...(m.to ? { to: m.to } : {}),
+        ...(m.host ? { host: m.host } : {}),
+        ...(m.label ? { label: m.label } : {}),
+        ...(m.sid ? { sid: m.sid } : {})
+      }))
+    }))
+  }
   if (!room) return text(`No room named "${room_name}". Rooms: ${store.rooms().map(r => r.name).join(', ') || '(none)'}`)
-  const msgs = store.logTail(room.id).slice(-(count || 30))
   if (msgs.length === 0) return text(`No logged history for "${room.name}" yet.`)
   return text(UNTRUSTED_NOTE + msgs.map(m => renderLine(m, true)).join('\n'))
 })
