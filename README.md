@@ -407,6 +407,43 @@ npm run anchor                              # later runs: rejoins every room it 
   and must match the sessions it serves. On start it reports its own network type, and
   warns if it is on a network that randomizes ports, where it would be a poor anchor.
 
+### Networks that only let HTTPS out (cloud sessions)
+
+Some networks block outbound UDP entirely, and Hyperswarm speaks nothing else. Cloud
+sandboxes are like this, and so are some offices. `status` shows `network.nat: offline`
+there: no DHT node answers, so no peer, relay or ordinary anchor can be reached.
+
+An anchor can also listen for **WebSockets**, which travel over plain HTTPS:
+
+```
+npm run anchor -- --ws-port 8443 --public-url wss://anchor.example.com
+# prints: wss://anchor.example.com/claude-together#<64 hex key>
+```
+
+In the session that cannot reach the DHT, tell Claude **"add anchor <that url>"** (the
+`add_anchor` tool; it is remembered for the machine, and `CLAUDE_TOGETHER_ANCHORS` takes
+a comma-separated list too). The session connects to the anchor, and from there
+everything works as usual. It joins with an ordinary invite code, which the anchor can
+redeem on the inviter's behalf. Messages flow to and from members on the DHT through
+the anchor. `status` lists each anchor as `connected`, or with `lastError` saying why not.
+
+- **Encryption does not depend on TLS.** Inside the WebSocket runs the same Noise
+  handshake Hyperswarm uses, so whatever terminates TLS on the way sees only
+  ciphertext. That could be a proxy that re-terminates it, as cloud sessions have, or a
+  tunnel in front of the anchor. The key after `#` is the anchor's. It is never sent to
+  the server, and a session refuses an anchor that answers with any other key.
+- **The anchor needs a public HTTPS address.** That can be a domain behind a reverse
+  proxy or a tunnel (Caddy, nginx, Cloudflare Tunnel) forwarding to `--ws-port`, or TLS
+  served directly with `--tls-cert`/`--tls-key`. Cloud sessions check certificates
+  through their proxy, so it must be a real certificate, not a self-signed one.
+- **On a cloud session, allow the anchor's host** under the environment's Network access
+  (Allowed domains). Until then the connection fails with the proxy's 403, and
+  `lastError` says so.
+- Sessions go out through `HTTPS_PROXY` when it is set, honoring `NO_PROXY`. `ws://`
+  URLs work for anchors on a private network.
+- The listener accepts at most 64 connections. One that proves no room key within 30
+  seconds is dropped, as on the DHT.
+
 ### Corporate networks: use your own bootstrap node
 
 Peers behind one restrictive corporate NAT hit a variant of the above that Tailscale

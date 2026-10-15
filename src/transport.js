@@ -8,6 +8,7 @@ import DHT from 'hyperdht'
 import hypercoreCrypto from 'hypercore-crypto'
 import b4a from 'b4a'
 import { projectStores } from './scope.js'
+import { parseAnchorUrl, dialAnchor, listenWebSocket } from './wslink.js'
 import { roomsInStore } from './store.js'
 import {
   generateInviteCode, deriveCodeKey, derive, topicFor,
@@ -254,9 +255,18 @@ export class Together extends EventEmitter {
   // anchor marks a headless always-on member (src/anchor.js): it says so in its hello,
   // and it accepts invites a member hands it, so people who cannot reach the inviter
   // can still redeem their code through it.
-  constructor ({ store, bootstrap = undefined, relay = undefined, firewall = undefined, dhtOptions = undefined, anchor = false } = {}) {
+  // anchorUrls are anchors to reach over WebSocket (src/wslink.js) in addition to the
+  // DHT, for networks that let nothing but HTTPS out.
+  constructor ({ store, bootstrap = undefined, relay = undefined, firewall = undefined, dhtOptions = undefined, anchor = false, anchorUrls = [] } = {}) {
     super()
     this.isAnchor = anchor === true
+    // url -> { anchor, dialer, state }. Parsed up front so a bad URL fails here, loudly.
+    this.anchorLinks = new Map()
+    for (const url of anchorUrls) {
+      const parsed = parseAnchorUrl(url)
+      this.anchorLinks.set(parsed.display, { anchor: parsed, dialer: null, state: { connected: false } })
+    }
+    this.wsListener = null
     this.store = store
     this.bootstrap = bootstrap
     this.relay = relay
@@ -322,6 +332,7 @@ export class Together extends EventEmitter {
       ...(this.relay ? { relayThrough: this.relay } : {})
     })
     this.swarm.on('connection', conn => this._onConnection(conn))
+    for (const link of this.anchorLinks.values()) this._dial(link)
 
     for (const room of this.store.rooms()) this._joinTopic(topicFor(room.key, 'room'))
 
@@ -437,8 +448,68 @@ export class Together extends EventEmitter {
     return this._rebuilding
   }
 
+  // Keep a WebSocket connection to an anchor up. What comes out of it is an ordinary
+  // room connection, authenticated by room keys like any other.
+  _dial (link) {
+    link.dialer?.stop()
+    link.dialer = dialAnchor({
+      anchor: link.anchor,
+      keyPair: this.swarm.keyPair,
+      onConnection: conn => this._onConnection(conn),
+      onState: state => { link.state = state }
+    })
+  }
+
+  addAnchorUrl (url) {
+    const parsed = parseAnchorUrl(url)
+    if (this.anchorLinks.has(parsed.display)) return { url: parsed.display, added: false }
+    const link = { anchor: parsed, dialer: null, state: { connected: false } }
+    this.anchorLinks.set(parsed.display, link)
+    if (this.swarm) this._dial(link)
+    return { url: parsed.display, added: true }
+  }
+
+  removeAnchorUrl (url) {
+    const parsed = parseAnchorUrl(url)
+    const link = this.anchorLinks.get(parsed.display)
+    if (!link) return { url: parsed.display, removed: false }
+    link.dialer?.stop()
+    this.anchorLinks.delete(parsed.display)
+    return { url: parsed.display, removed: true }
+  }
+
+  // Anchor side: accept sessions over WebSocket as well as over the DHT. The key comes
+  // from the store so the URL handed out survives restarts.
+  async listenWebSocket ({ port, host, tlsOptions } = {}) {
+    const keyPair = hypercoreCrypto.keyPair(this.store.wsSeed())
+    this.wsListener = await listenWebSocket({
+      port,
+      host,
+      keyPair,
+      tlsOptions,
+      onConnection: conn => this._onConnection(conn),
+      onError: err => this.emit('warning', err)
+    })
+    return { port: this.wsListener.port, key: b4a.toString(keyPair.publicKey, 'hex') }
+  }
+
+  anchorStatus () {
+    return [...this.anchorLinks.entries()].map(([url, link]) => ({
+      url,
+      connected: !!link.state.connected,
+      ...(link.state.at ? { since: new Date(link.state.at).toISOString() } : {}),
+      ...(link.state.error ? { lastError: link.state.error } : {})
+    }))
+  }
+
   async stop () {
     clearInterval(this._maintenance)
+    for (const link of this.anchorLinks.values()) {
+      link.dialer?.stop()
+      link.dialer = null
+    }
+    await this.wsListener?.close()
+    this.wsListener = null
     for (const { timer } of this.pendingInvites.values()) clearTimeout(timer)
     for (const { timer, reject, retry } of this.pendingJoins.values()) {
       clearTimeout(timer)
@@ -1180,6 +1251,13 @@ export class Together extends EventEmitter {
               if (room) {
                 inv.granted = true
                 this._announceInviteSpent(cand.id, inv.roomId, conn)
+                // The joiner accepts a grant only on a connection where we have proven the
+                // code too. Our proofs normally get there first, but not when the joiner
+                // started joining over a connection that already existed: then our proof
+                // of the code went out before it held the code, it ignored it, and the
+                // grant would arrive ahead of the next one and be dropped. Proving again
+                // first costs one line and keeps the order right.
+                this._sendProofs(conn, state)
                 const grant = JSON.stringify({
                   roomKey: b4a.toString(room.key, 'base64'),
                   roomName: room.name
@@ -1731,9 +1809,12 @@ export class Together extends EventEmitter {
     // looks like (some cloud sandboxes and locked-down corporate networks). No relay
     // or anchor helps here: reaching either needs the same UDP.
     if (dht?.bootstrapped && dht.toArray().length === 0) {
+      const viaWs = [...this.anchorLinks.values()].some(l => l.state.connected)
       return {
         nat: 'offline',
-        explanation: 'no DHT node answered. This network appears to block outbound UDP, which claude-together needs to reach anyone: neither a relay nor an anchor can help until UDP is allowed (or a bootstrap inside this network is configured)'
+        explanation: viaWs
+          ? 'no DHT node answered (this network blocks outbound UDP), so rooms are reached only through the WebSocket anchor(s) listed under anchors'
+          : 'no DHT node answered. This network appears to block outbound UDP, which the DHT needs. Rooms can still be reached through an anchor listening for WebSockets: run one with --ws-port on a machine with a public address, and add its URL here with add_anchor (on a cloud session, also allow its host in the environment\'s network settings)'
       }
     }
     if (!dht || dht.host === null) {
@@ -1826,6 +1907,8 @@ export class Together extends EventEmitter {
       displayName: this.store.getName(),
       session: { host: os.hostname().slice(0, 64), label: sessionLabel(), sid: this.sid, harness: harnessName() },
       network: this.network(),
+      ...(this.anchorLinks.size ? { anchors: this.anchorStatus() } : {}),
+      ...(this.wsListener ? { webSocketListener: { port: this.wsListener.port } } : {}),
       rooms,
       pendingInvites: this.pendingInvites.size,
       pendingPairings: [...this.pendingPairs.values()].map(s => this._pairingView(s)),
