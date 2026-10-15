@@ -326,7 +326,8 @@ trusted.
   name is taken on faith, display names are not unique, and `host`/`label`/`sid` remain
   self-asserted decoration. Treat the warnings as real, and the absence of warnings as
   strong-but-not-absolute.
-- **Any member can invite anyone.** There is no admin role or approval step.
+- **Any member can invite anyone.** There is no admin role or approval step. An
+  invite made while an anchor is connected is redeemable through the anchor as well.
 - **Prompt-injection risk is real.** Messages are injected into your live Claude session
   (mid-turn for `interrupt` priority, when the agent has tool access). The untrusted-data
   framing reduces but does not eliminate the risk that a crafted message manipulates the
@@ -353,8 +354,95 @@ to your inbox, and start a new room if it might have leaked.
   whoever reconnects. A message is only stuck if literally no one who has it is
   online at the same time as you.
 - **No central relay by design**: if two peers are both behind carrier-grade NAT,
-  hole punching can fail (~5% of pairings). Easiest fix: both install
-  [Tailscale](https://tailscale.com) — the swarm then finds the direct tailnet path.
+  hole punching can fail (~5% of pairings). `status` says when that is happening and
+  why (below). The fixes, simplest first: an [anchor](#anchors-for-members-who-cannot-reach-each-other)
+  on any well-connected machine, or both installing [Tailscale](https://tailscale.com)
+  so the swarm finds the direct tailnet path.
+
+### Seeing why someone is not connecting
+
+A peer you can never reach used to look exactly like a peer who never came online.
+`status` now tells them apart:
+
+- `network.nat` says what this machine's network does: `consistent ports` (hole
+  punching works with nearly everyone), `random ports` (a symmetric NAT, common on
+  hotspots, guest and corporate Wi-Fi: direct connections fail to peers whose network
+  does the same), `open` (reachable directly, which makes this machine a good anchor),
+  or `offline` (no DHT node answered at all: the network blocks outbound UDP, which
+  claude-together needs, so no relay or anchor can help until UDP is allowed. Some cloud
+  sandboxes are like this).
+- Each room lists `unreachablePeers`: peers announcing on the room's topic that every
+  connection attempt to has failed, with the error and a plain-language reason. Two
+  Wi-Fi networks in one building whose NAT does not loop back (hairpin) show up here as
+  timeouts; two networks that both randomize ports show up as exactly that.
+
+### Anchors: for members who cannot reach each other
+
+Members already forward live messages to everyone else they are connected to, and
+replay their recent log to whoever reconnects. So two people who cannot connect to each
+other still talk, as long as someone both of them can reach is online. An **anchor** is
+a member that is always there to be that someone: a headless session with nobody behind
+it, run on any machine with a decent network that stays up (a home server, an always-on
+desktop, a small VPS).
+
+```
+npm run anchor -- --join X7KQ-2MPF-3HV9     # a code from any member's create_invite
+npm run anchor                              # later runs: rejoins every room it holds
+```
+
+- **Adding one is a member's decision.** It joins by redeeming an ordinary invite, and
+  the room sees it join under its own name (`anchor-<hostname>`, or `--name`). `status`
+  marks it as an anchor.
+- **Joining works through it too.** Redeeming an invite normally needs a direct
+  connection to whoever made it, which is the very thing that fails here. When a member
+  creates an invite while an anchor is connected, the anchor is handed the code as well,
+  so the joiner can redeem it through the anchor, and the inviter does not even need to
+  stay online. The code is still single-use: whoever grants it tells the rest of the
+  room at once.
+- **It is a member, with a member's access.** It holds the room key and can read the
+  room, like anyone in it. Run it on a machine you would trust with that. It keeps its
+  own identity and store (`~/.claude-together/anchor`, or `--dir`), drops its inbox, and
+  keeps only the room log it replays.
+- `CLAUDE_TOGETHER_BOOTSTRAP` and `CLAUDE_TOGETHER_RELAY` apply to it as to any session
+  and must match the sessions it serves. On start it reports its own network type, and
+  warns if it is on a network that randomizes ports, where it would be a poor anchor.
+
+### Networks that only let HTTPS out (cloud sessions)
+
+Some networks block outbound UDP entirely, and Hyperswarm speaks nothing else. Cloud
+sandboxes are like this, and so are some offices. `status` shows `network.nat: offline`
+there: no DHT node answers, so no peer, relay or ordinary anchor can be reached.
+
+An anchor can also listen for **WebSockets**, which travel over plain HTTPS:
+
+```
+npm run anchor -- --ws-port 8443 --public-url wss://anchor.example.com
+# prints: wss://anchor.example.com/claude-together#<64 hex key>
+```
+
+In the session that cannot reach the DHT, tell Claude **"add anchor <that url>"** (the
+`add_anchor` tool; it is remembered for the machine, and `CLAUDE_TOGETHER_ANCHORS` takes
+a comma-separated list too). The session connects to the anchor, and from there
+everything works as usual. It joins with an ordinary invite code, which the anchor can
+redeem on the inviter's behalf. Messages flow to and from members on the DHT through
+the anchor. `status` lists each anchor as `connected`, or with `lastError` saying why not.
+
+- **Encryption does not depend on TLS.** Inside the WebSocket runs the same Noise
+  handshake Hyperswarm uses, so whatever terminates TLS on the way sees only
+  ciphertext. That could be a proxy that re-terminates it, as cloud sessions have, or a
+  tunnel in front of the anchor. The key after `#` is the anchor's. It is never sent to
+  the server, and a session refuses an anchor that answers with any other key.
+- **The anchor needs a public HTTPS address.** That can be a domain behind a reverse
+  proxy or a tunnel (Caddy, nginx, Cloudflare Tunnel) forwarding to `--ws-port`, or TLS
+  served directly with `--tls-cert`/`--tls-key`. Cloud sessions check certificates
+  through their proxy, so it must be a real certificate, not a self-signed one.
+- **On a cloud session, allow the anchor's host** under the environment's Network access
+  (Allowed domains). Until then the connection fails with the proxy's 403, and
+  `lastError` says so.
+- Sessions go out through `HTTPS_PROXY` when it is set, honoring `NO_PROXY`. `ws://`
+  URLs work for anchors on a private network.
+- The listener accepts at most 64 connections. One that proves no room key within 30
+  seconds is dropped, as on the DHT.
 
 ### Corporate networks: use your own bootstrap node
 
