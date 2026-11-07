@@ -136,15 +136,16 @@ function sessionLabel () {
 }
 
 // Which agent harness this server is running under. Adapters/users set the env
-// var explicitly; CLAUDECODE=1 is set by Claude Code and serves as a fallback.
+// var explicitly; CLAUDECODE=1 is set by Claude Code, and register:codex sets
+// CLAUDE_TOGETHER_CODEX=1 in the MCP server's environment (Codex starts MCP servers
+// with a minimal environment of its own).
 // NOTE: harness is deliberately NOT covered by the message signature — the
 // 0.3.0 canonical signing form is frozen, so this field is advisory decoration
 // like the version string. Kept identical to session-multiplayer for interop.
-function harnessName () {
-  const env = process.env.SESSION_MULTIPLAYER_HARNESS
-  if (env) return env.slice(0, 32).replace(/[^A-Za-z0-9._ -]/g, '')
-  if (process.env.CLAUDECODE) return 'claude-code'
-  if (process.env.CODEX_HOME || process.env.CODEX_API_KEY) return 'codex'
+export function harnessName (env = process.env) {
+  if (env.SESSION_MULTIPLAYER_HARNESS) return env.SESSION_MULTIPLAYER_HARNESS.slice(0, 32).replace(/[^A-Za-z0-9._ -]/g, '')
+  if (env.CLAUDECODE) return 'claude-code'
+  if (env.CLAUDE_TOGETHER_CODEX || env.CODEX_HOME || env.CODEX_API_KEY) return 'codex'
   return 'mcp'
 }
 

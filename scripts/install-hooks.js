@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url'
 import { projectDir } from '../src/scope.js'
 import { isOurs, HOOK_SCRIPT, readSettingsText, writeSettingsAtomic } from '../src/hooks.js'
 
-function readSettings (settingsPath) {
+export function readSettings (settingsPath) {
   if (!fs.existsSync(settingsPath)) return {}
   try {
     return JSON.parse(readSettingsText(settingsPath))
@@ -29,7 +29,7 @@ function readSettings (settingsPath) {
 // Remove only our hook commands from a list of hook groups. A group can hold several
 // commands; dropping the whole group because one of them was ours would silently take
 // the user's own hooks with it. A group is removed only once nothing is left in it.
-function withoutOurs (groups, hookScript) {
+export function withoutOurs (groups, hookScript) {
   const kept = []
   let removed = false
   for (const group of groups) {

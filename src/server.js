@@ -11,6 +11,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { Together, VERSION, PKG_ROOT, parseBootstrap, parseRelay } from './transport.js'
 import { projectDir } from './scope.js'
 import { hooksStatus } from './hooks.js'
+import { codexHooksStatus } from './codex.js'
 import { hash, randomBytes, fingerprint } from './crypto.js'
 
 // Discovery normally bootstraps off the public hyperdht nodes, and peers are then
@@ -415,7 +416,9 @@ server.registerTool('status', {
     : 'none — a connection that cannot be made directly is simply not made'
   // Whether messages arrive by themselves is not something the user can see anywhere
   // else: a project with no hooks looks exactly like a room where nobody is talking.
-  const delivery = hooksStatus().summary
+  const delivery = (process.env.CLAUDE_TOGETHER_CODEX
+    ? codexHooksStatus(projectDir())
+    : hooksStatus()).summary
   return text(JSON.stringify({ scope, discovery, relay, delivery, ...together.status() }, null, 2))
 })
 

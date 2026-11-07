@@ -12,6 +12,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { installHooks, removeUserWideHooks } from './install-hooks.js'
+import { installCodex } from './install-codex.js'
 import { registrationTarget } from '../src/scope.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -23,6 +24,46 @@ if (project === root) {
   console.error('Run `npm run register` from the project directory you want to be reachable in:')
   console.error(`  cd /path/to/your/project && npm --prefix "${root}" run register`)
   process.exit(1)
+}
+
+// Which harnesses to register for. No flag keeps the original behaviour (Claude Code
+// only); --codex alone registers Codex only; both flags register both.
+const flags = new Set(process.argv.slice(2))
+const forCodex = flags.has('--codex')
+const forClaude = flags.has('--claude') || !forCodex
+
+if (forCodex) {
+  console.log(`Registering claude-together with Codex for project: ${project}\n`)
+  try {
+    const r = await installCodex(project)
+    console.log(`Delivery hooks: ${r.hooksFile}`)
+    console.log(`MCP server:     ${r.configFile} [mcp_servers.claude-together]`)
+    console.log(`Trusted in ~/.codex/config.toml: the project, and ${r.trustedNow ? `${r.trustedNow} new or changed hook(s)` : 'hooks already trusted'}.`)
+    if (r.alsoTrusted.length) {
+      console.log(`NOTE: trusting this project also lets Codex load the rest of ${r.configFile}: ${r.alsoTrusted.join(', ')}.`)
+      console.log('      That is the repo\'s own setup (it may start other MCP servers or change sandbox/approval settings); check it if you did not write it.')
+    }
+    if (r.git.excluded.length) console.log(`Kept out of git via .git/info/exclude: ${r.git.excluded.join(', ')}`)
+    if (r.git.tracked.length) console.log(`WARNING: this repo tracks ${r.git.tracked.join(', ')}; the change holds absolute paths for this machine — do not commit it.`)
+    for (const w of [...r.warnings, ...r.errors]) console.log(`Codex says: ${typeof w === 'string' ? w : JSON.stringify(w)}`)
+    if (!r.mcpSeen) {
+      console.error('\nCodex does not see [mcp_servers.claude-together] for this project. Check the project file above.')
+      process.exitCode = 1
+    }
+    const missing = ['postToolUse', 'stop', 'userPromptSubmit'].filter(e => !r.events.includes(e))
+    if (missing.length) {
+      console.error(`\nCodex does not run our ${missing.join(', ')} hook(s) for this project. Open /hooks in the Codex CLI here to see why.`)
+      process.exitCode = 1
+    } else {
+      console.log('Codex confirms all three delivery hooks are trusted and enabled' + (r.mcpSeen ? ', and sees the MCP server.' : '.'))
+    }
+    console.log('Restart (or start) a Codex session in this project to load the MCP server.\n')
+  } catch (err) {
+    console.error(`Could not register with Codex: ${err.message}`)
+    console.error('Is the `codex` CLI installed and on PATH? (CODEX_BIN can point at it.)\n')
+    process.exitCode = 1
+  }
+  if (!forClaude) process.exit(process.exitCode || 0)
 }
 
 console.log(`Registering claude-together for project: ${project}\n`)

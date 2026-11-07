@@ -62,6 +62,40 @@ If the `claude` CLI isn't on your PATH it prints the exact command to run manual
 > `~/.claude/settings.json`, where they fired in every project. `npm run register`
 > removes those entries (leaving any other hooks alone) and tells you it did.
 
+## Codex
+
+The same rooms work from **[Codex](https://github.com/openai/codex)** sessions. A room
+can mix Claude Code and Codex freely: the MCP tools, the wire protocol and the inbox
+are identical, and every message shows which harness sent it (`claude-code`, `codex`).
+
+```bash
+cd /path/to/your/project
+npm --prefix /path/to/claude-together run register:codex   # Codex only
+npm --prefix /path/to/claude-together run register:all     # Claude Code and Codex
+```
+
+`register:codex` is per project, like the Claude Code registration:
+
+| Where | What |
+|---|---|
+| `<project>/.codex/hooks.json` | The same delivery hooks (`PostToolUse`, `Stop`, `UserPromptSubmit`) — Codex speaks the same hook protocol |
+| `<project>/.codex/config.toml` | `[mcp_servers.claude-together]`, pinned to this project's store |
+| `~/.codex/config.toml` | The project marked trusted, and our three hooks trusted by hash |
+
+Codex ignores a project's `.codex/` folder until the project is trusted, and silently
+skips any hook whose exact definition has not been trusted — without either, the
+tools or the deliveries simply never show up. Registration records both through
+Codex's own app-server (`hooks/list`, `config/batchWrite`), the same path as the
+`/hooks` screen, then reads the setup back and fails loudly if Codex would not load
+it. Both project files contain absolute paths for this machine, so inside a git repo
+they are added to `.git/info/exclude` (never to your `.gitignore`); if your repo
+already tracks either file you get a warning instead.
+
+Slash commands and the status line are Claude Code features; in Codex, just say it
+("create an invite for room bug-hunt", "check my messages"). Codex asks before each
+claude-together tool call under its default approval settings; registration leaves
+that as it is, since sending to a room is worth a look.
+
 ## Usage
 
 Two equivalent ways: **slash commands** (installed by `npm run register`) or plain
@@ -472,6 +506,9 @@ sudo loginctl enable-linger $USER    # or it only runs while you are logged in
 - [`src/store.js`](src/store.js) — persistence: identity, room keys, inbox/outbox
 - [`src/scope.js`](src/scope.js) — per-project store scoping (shared by server and hooks)
 - [`src/hooks.js`](src/hooks.js) — where delivery hooks live and whether they are installed
+- [`src/codex.js`](src/codex.js) — Codex app-server client and Codex hook status
+- [`scripts/install-codex.js`](scripts/install-codex.js) — per-project Codex registration
+  (`npm run register:codex`)
 - [`scripts/bootstrap-node.js`](scripts/bootstrap-node.js) — DHT bootstrap node for a
   private network: `npm run bootstrap-node -- --host <lan ip>`
 - [`scripts/statusline.py`](scripts/statusline.py) — Claude Code status line: usage
@@ -490,6 +527,8 @@ sudo loginctl enable-linger $USER    # or it only runs while you are logged in
 - [`test/link.js`](test/link.js) — a second working directory joining a room locally
 - [`test/bootstrap.js`](test/bootstrap.js) — repointing discovery while the session runs
 - [`test/register.js`](test/register.js) — per-project hook installation
+- [`test/codex.js`](test/codex.js) — Codex registration, trust and delivery, against
+  Codex's real app-server in a throwaway `CODEX_HOME`
 
 ## Status line
 

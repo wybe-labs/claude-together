@@ -12,10 +12,15 @@ import path from 'node:path'
 import { scopedDir } from '../src/scope.js'
 
 const mode = process.argv[2]
+// Codex sets no CLAUDE_PROJECT_DIR, and one inherited from elsewhere would point at
+// another project, so register:codex passes the project after the mode and it wins —
+// the same folder the MCP server is pinned to.
+if (process.argv[3]) process.env.CLAUDE_PROJECT_DIR = process.argv[3]
 // Same per-project scoping as the MCP server (src/scope.js): hooks run in the
 // project directory with CLAUDE_PROJECT_DIR set, so this drains only the inbox
 // of rooms THIS project joined — never mail belonging to other projects.
 const inbox = path.join(scopedDir(), 'inbox')
+
 
 function drain (priorities) {
   let files

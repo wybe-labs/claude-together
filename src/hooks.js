@@ -25,7 +25,8 @@ export function isOurs (command, hookScript = HOOK_SCRIPT) {
   // one of our three modes — in a folder whose name reads claude-together. Before, any
   // command containing "claudetogether" and "hook.js" matched, so a project hook such
   // as ClaudeTogether/.claude/hooks/lint-hook.js would have been removed as ours.
-  return /claude-?together[\\/](?:.*[\\/])?scripts[\\/]hook\.js"?\s+(posttool|stop|prompt)\s*$/i.test(c)
+  // Codex hook commands carry the project as a quoted argument after the mode.
+  return /claude-?together[\\/](?:.*[\\/])?scripts[\\/]hook\.js"?\s+(posttool|stop|prompt)(\s+"[^"]*")?\s*$/i.test(c)
 }
 
 // Settings files are edited by hand and by other tools. Some Windows editors (and
