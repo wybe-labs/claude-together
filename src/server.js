@@ -10,6 +10,7 @@ import path from 'node:path'
 import { spawn, execFileSync } from 'node:child_process'
 import { Together, VERSION, PKG_ROOT, parseBootstrap, parseRelay } from './transport.js'
 import { projectDir } from './scope.js'
+import { parseAnchorUrl } from './wslink.js'
 import { hooksStatus } from './hooks.js'
 import { hash, randomBytes, fingerprint } from './crypto.js'
 
@@ -28,10 +29,24 @@ const envBootstrap = parseBootstrap(process.env.CLAUDE_TOGETHER_BOOTSTRAP)
 const bootstrapPinnedByEnv = envBootstrap !== undefined
 const envRelay = parseRelay(process.env.CLAUDE_TOGETHER_RELAY)
 const relayPinnedByEnv = envRelay !== undefined
+// Anchors reached over WebSocket: the stored list plus any CLAUDE_TOGETHER_ANCHORS adds
+// (comma-separated). Unlike the bootstrap these add up rather than override: an anchor
+// is one more way in, and naming one never takes another away.
+const envAnchors = (process.env.CLAUDE_TOGETHER_ANCHORS || '').split(',').map(s => s.trim()).filter(Boolean)
 const together = new Together({
   store,
   bootstrap: envBootstrap ?? (store.getBootstrap() || undefined),
-  relay: envRelay ?? (parseRelay(store.getRelay()) || undefined)
+  relay: envRelay ?? (parseRelay(store.getRelay()) || undefined),
+  // A malformed entry must not keep the server from starting: say so and go on without it.
+  anchorUrls: [...new Set([...store.getAnchorUrls(), ...envAnchors])].filter(url => {
+    try {
+      parseAnchorUrl(url)
+      return true
+    } catch (err) {
+      console.error(`claude-together: ignoring anchor ${url}: ${err.message}`)
+      return false
+    }
+  })
 })
 
 const CLUSTER_STATE = path.join(os.homedir(), '.claude-together', 'local-bootstrap.json')
@@ -163,7 +178,11 @@ server.registerTool('create_invite', {
     `Invite code for room "${inv.roomName}": ${inv.code}\n` +
     `Single use, valid for ${inv.expiresInMinutes} minutes. Send it to your friend privately and ` +
     `tell them to say: "join room ${inv.code}". Anyone holding the code can join, so don't post it ` +
-    'publicly. Keep this session open until they have joined.'
+    'publicly. ' +
+    (inv.alsoRedeemableVia
+      ? `The room's anchor also holds the code, so they can join through it even if they cannot reach this ` +
+        'machine directly; keeping this session open is not required.'
+      : 'Keep this session open until they have joined.')
   )
 })
 
@@ -333,6 +352,30 @@ server.registerTool('set_relay', {
     : 'Relaying is off. A connection that cannot be made directly will simply not be made.')
 })
 
+server.registerTool('add_anchor', {
+  title: 'Reach rooms through an anchor over WebSocket',
+  description: 'Connect to a Claude Together anchor over WebSocket (HTTPS), for networks where the DHT cannot be reached at all: status shows network.nat "offline" there, which is what cloud sandboxes and networks that block outbound UDP look like. Pass the URL exactly as the anchor printed it, wss://host/claude-together#<64 hex key>; the key after # is what proves the far end is the anchor, so never drop or alter it. Remembered for this machine and applied at once, no restart. The anchor is a room member: it carries the rooms it is in to this session, and only rooms whose key this project already holds (or joins through an invite) are reachable this way. On a cloud session the anchor\'s host must also be allowed in the environment\'s network settings; if the connection is refused with a 403 from the proxy, tell your user exactly that.',
+  inputSchema: { url: z.string().describe('The anchor URL, wss://host/claude-together#<key>') }
+}, async ({ url }) => {
+  const res = together.addAnchorUrl(url)
+  store.setAnchorUrls([...new Set([...store.getAnchorUrls(), res.url])])
+  return text(res.added
+    ? `Connecting to the anchor at ${res.url}. Check status in a few seconds: anchors[].connected says whether it is up, and lastError says why not.`
+    : `Already using the anchor at ${res.url}.`)
+})
+
+server.registerTool('remove_anchor', {
+  title: 'Stop using a WebSocket anchor',
+  description: 'Stop reaching rooms through the anchor at this URL, and forget it for this machine.',
+  inputSchema: { url: z.string().describe('The anchor URL as add_anchor was given it') }
+}, async ({ url }) => {
+  const res = together.removeAnchorUrl(url)
+  store.setAnchorUrls(store.getAnchorUrls().filter(u => u !== res.url))
+  const fromEnv = envAnchors.some(u => { try { return parseAnchorUrl(u).display === res.url } catch { return false } })
+  return text((res.removed ? `Stopped using the anchor at ${res.url}.` : `Was not using the anchor at ${res.url}.`) +
+    (fromEnv ? ' It is also named in CLAUDE_TOGETHER_ANCHORS, so the next session will use it again until that is removed.' : ''))
+})
+
 server.registerTool('link_room', {
   title: 'Link a room you already hold in another project',
   description: 'Join a room that another project on THIS machine already belongs to, by copying its key locally. No rendezvous, no number to compare, no network: the key is already on this machine, so nothing new is granted and there is nothing to verify. Use this to add a second working directory to a room you are already in — pairing is for reaching another person, not for moving your own key between your own directories. Each project keeps its own inbox, so both sessions receive every message independently instead of competing to read it. The room\'s other members are told that another of your sessions has joined.',
@@ -390,19 +433,39 @@ server.registerTool('show_history', {
   description: 'Read the recent chat log of a room (up to the last 200 messages / 7 days), including messages relayed while you were offline. Non-destructive: unlike check_messages this clears nothing — use it to answer "what did they say earlier?".',
   inputSchema: {
     room_name: z.string().describe('Room whose history to show'),
-    count: z.number().int().min(1).max(200).optional().describe('How many recent messages (default 30)')
+    count: z.number().int().min(1).max(200).optional().describe('How many recent messages (default 30)'),
+    format: z.enum(['text', 'json']).optional().describe('"json" returns the messages as data, for programs such as the Claude Together panel; leave it out when reading history to a person')
   }
-}, async ({ room_name, count }) => {
+}, async ({ room_name, count, format }) => {
   const room = store.roomByName(room_name)
+  const msgs = room ? store.logTail(room.id).slice(-(count || 30)) : []
+  // For programs: the same messages as fields, with no prose to parse. The text in them
+  // is still other people's words, which the reader must treat as data.
+  if (format === 'json') {
+    if (!room) return { content: [{ type: 'text', text: JSON.stringify({ error: `no room named "${room_name}"` }) }], isError: true }
+    return text(JSON.stringify({
+      room: room.name,
+      messages: msgs.map(m => ({
+        id: m.id,
+        from: m.from,
+        text: m.text,
+        ts: m.ts,
+        kind: m.kind,
+        ...(m.to ? { to: m.to } : {}),
+        ...(m.host ? { host: m.host } : {}),
+        ...(m.label ? { label: m.label } : {}),
+        ...(m.sid ? { sid: m.sid } : {})
+      }))
+    }))
+  }
   if (!room) return text(`No room named "${room_name}". Rooms: ${store.rooms().map(r => r.name).join(', ') || '(none)'}`)
-  const msgs = store.logTail(room.id).slice(-(count || 30))
   if (msgs.length === 0) return text(`No logged history for "${room.name}" yet.`)
   return text(UNTRUSTED_NOTE + msgs.map(m => renderLine(m, true)).join('\n'))
 })
 
 server.registerTool('status', {
   title: 'Multiplayer status',
-  description: 'Show your display name, rooms joined by this project, currently connected peers, known room members with last-seen times, queued undelivered messages, unread count, which bootstrap discovery uses, and whether delivery hooks are installed for this project. If they are not, say so when reporting status: incoming messages will not appear on their own until check_messages is called.',
+  description: 'Show your display name, rooms joined by this project, currently connected peers, known room members with last-seen times, queued undelivered messages, unread count, which bootstrap discovery uses, whether delivery hooks are installed for this project, what kind of network this machine is on (network.nat), and, per room, peers that were found but could not be connected to (unreachablePeers, each with a plain-language reason). If the session reaches anchors over WebSocket, anchors lists each with connected and lastError; relay lastError to the user when one is not connected. When a room has unreachable peers, relay their \"why\" to the user: it says what to do about it. If delivery hooks are not installed, say so when reporting status: incoming messages will not appear on their own until check_messages is called.',
   inputSchema: {}
 }, async () => {
   const scope = process.env.CLAUDE_TOGETHER_DIR

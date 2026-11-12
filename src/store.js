@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import b4a from 'b4a'
 import { scopedDir, identityFile } from './scope.js'
-import { signKeyPair, normalizeCode } from './crypto.js'
+import { signKeyPair, normalizeCode, randomBytes } from './crypto.js'
 
 const LOG_REPLAY_MAX = 200
 const LOG_REPLAY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
@@ -147,6 +147,31 @@ export class Store {
       if (key) c.relay = key
       else delete c.relay
     })
+  }
+
+  // Anchors this machine reaches over WebSocket (src/wslink.js), as the URLs the
+  // anchors print. Machine-wide, like the relay: needing them is a property of the
+  // network this computer is on, typically one that lets nothing but HTTPS out.
+  getAnchorUrls () {
+    const stored = this._readIdentity().anchors
+    return Array.isArray(stored) ? stored.filter(u => typeof u === 'string') : []
+  }
+
+  setAnchorUrls (urls) {
+    this._updateIdentity(c => {
+      if (urls && urls.length) c.anchors = urls
+      else delete c.anchors
+    })
+  }
+
+  // Seed of the key an anchor's WebSocket listener answers with. It has to outlive
+  // restarts, because sessions hold the key in the URL they were given.
+  wsSeed () {
+    const c = this._readIdentity()
+    if (typeof c.wsSeed === 'string' && /^[0-9a-f]{64}$/.test(c.wsSeed)) return b4a.from(c.wsSeed, 'hex')
+    const seed = randomBytes(32)
+    this._updateIdentity(cfg => { cfg.wsSeed = b4a.toString(seed, 'hex') })
+    return seed
   }
 
   setBootstrap (nodes) {
@@ -403,12 +428,13 @@ export class Store {
     const members = this.membersFor(roomId)
     const prev = members[name]
     const pinsKey = info?.pk && !prev?.pk && /^[0-9a-f]{64}$/.test(info.pk)
-    const hasNewInfo = (info && (info.host || info.label || info.harness)) || pinsKey
+    const hasNewInfo = (info && (info.host || info.label || info.harness || (info.anchor && !prev?.anchor))) || pinsKey
     if (prev && prev.lastSeen >= ts && !hasNewInfo) return
     const next = { ...(prev || {}), lastSeen: Math.max(ts, prev?.lastSeen || 0) }
     if (info?.host) next.host = String(info.host).slice(0, 64)
     if (info?.label) next.label = String(info.label).slice(0, 64)
     if (info?.harness) next.harness = String(info.harness).slice(0, 32)
+    if (info?.anchor) next.anchor = true
     // TOFU pin: a member's first verified public key sticks; it is never
     // overwritten here — a different key later is flagged upstream, not adopted.
     if (pinsKey) next.pk = info.pk
