@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "wybe-trinity@wybe-claude-plugins": true,
+    "human-todo@wybe-claude-plugins": true
+  }
+}
